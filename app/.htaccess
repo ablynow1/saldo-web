@@ -1,0 +1,2 @@
+# Bloqueia acesso direto aos arquivos da aplicação
+Require all denied

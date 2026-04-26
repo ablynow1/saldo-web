@@ -1,0 +1,28 @@
+# Credenciais e configuração local — NUNCA commitar
+_ftp_secrets.py
+app/config/config.php
+app/config/.setup_token
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude / agente local
+.agent/
+.claude/
+
+# Logs e arquivos temporários
+*.log
+*.tmp
+*.bak
+
+# Composer (se usar futuramente)
+vendor/
+
+# Pasta com repositório git próprio (não faz parte do SALDO WEB)
+gsap-slides/
+
+# OS
+.DS_Store
+Thumbs.db
