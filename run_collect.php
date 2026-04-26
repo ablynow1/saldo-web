@@ -32,9 +32,18 @@ try {
     exit;
 }
 
-$datePreset = $dateOverride ? 'custom' : 'yesterday';
-$since = $dateOverride ?: null;
-$until = $dateOverride ?: null;
+// Se a data informada é hoje, usa preset 'today' para o Meta retornar dados parciais do dia.
+// Caso contrário, usa 'custom' com a data específica, ou 'yesterday' como padrão.
+if ($dateOverride === date('Y-m-d')) {
+    $datePreset = 'today';
+    $since = $until = $dateOverride;
+} elseif ($dateOverride) {
+    $datePreset = 'custom';
+    $since = $until = $dateOverride;
+} else {
+    $datePreset = 'yesterday';
+    $since = $until = null;
+}
 
 $accounts = Db::all(
     'SELECT ma.*, c.name AS client_name
@@ -63,7 +72,13 @@ foreach ($accounts as $acc) {
 }
 
 $elapsed = round(microtime(true) - $startedAt, 1);
-$dateLabel = $dateOverride ?: date('d/m/Y', strtotime('-1 day')) . ' (ontem)';
+if ($dateOverride === date('Y-m-d')) {
+    $dateLabel = date('d/m/Y') . ' (hoje · parcial)';
+} elseif ($dateOverride) {
+    $dateLabel = date('d/m/Y', strtotime($dateOverride));
+} else {
+    $dateLabel = date('d/m/Y', strtotime('-1 day')) . ' (ontem)';
+}
 
 $title = 'Coleta de Insights · SALDO WEB';
 ob_start();
@@ -147,12 +162,12 @@ ob_start();
       <div>
         <label class="form-label" style="font-size:12px">Data (YYYY-MM-DD)</label>
         <input type="date" name="date" class="form-control" style="width:200px"
-               max="<?= date('Y-m-d', strtotime('-1 day')) ?>"
+               max="<?= date('Y-m-d') ?>"
                value="<?= e($dateOverride ?: date('Y-m-d', strtotime('-1 day'))) ?>">
       </div>
       <button type="submit" class="btn btn-primary"><i class="bi bi-arrow-clockwise"></i> Coletar esta data</button>
     </form>
-    <div class="form-hint">Útil para reprocessar um dia que falhou ou buscar dados históricos.</div>
+    <div class="form-hint">Útil para reprocessar um dia que falhou, buscar dados históricos, ou capturar o parcial de hoje.</div>
   </div>
 </div>
 

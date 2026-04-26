@@ -6,10 +6,11 @@ $accountId = (int) ($_GET['account'] ?? 0);
 $period    = $_GET['period'] ?? '7d';
 
 $periodMap = [
-    '1d'  => ['label' => 'Ontem',   'since' => date('Y-m-d', strtotime('-1 day')),   'until' => date('Y-m-d', strtotime('-1 day'))],
-    '7d'  => ['label' => '7 dias',  'since' => date('Y-m-d', strtotime('-7 days')),  'until' => date('Y-m-d', strtotime('-1 day'))],
-    '14d' => ['label' => '14 dias', 'since' => date('Y-m-d', strtotime('-14 days')), 'until' => date('Y-m-d', strtotime('-1 day'))],
-    '30d' => ['label' => '30 dias', 'since' => date('Y-m-d', strtotime('-30 days')), 'until' => date('Y-m-d', strtotime('-1 day'))],
+    'today' => ['label' => 'Hoje',    'since' => date('Y-m-d'),                          'until' => date('Y-m-d')],
+    '1d'    => ['label' => 'Ontem',   'since' => date('Y-m-d', strtotime('-1 day')),     'until' => date('Y-m-d', strtotime('-1 day'))],
+    '7d'    => ['label' => '7 dias',  'since' => date('Y-m-d', strtotime('-7 days')),    'until' => date('Y-m-d', strtotime('-1 day'))],
+    '14d'   => ['label' => '14 dias', 'since' => date('Y-m-d', strtotime('-14 days')),   'until' => date('Y-m-d', strtotime('-1 day'))],
+    '30d'   => ['label' => '30 dias', 'since' => date('Y-m-d', strtotime('-30 days')),   'until' => date('Y-m-d', strtotime('-1 day'))],
 ];
 $p     = $periodMap[$period] ?? $periodMap['7d'];
 $since = $p['since'];
@@ -170,7 +171,14 @@ ob_start();
     </div>
     <form method="post" action="<?= e(base_url('run_collect.php')) ?>">
       <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
-      <button class="btn btn-secondary btn-sm" title="Coletar dados de ontem"><i class="bi bi-arrow-clockwise"></i> Coletar</button>
+      <?php if ($period === 'today'): ?>
+        <input type="hidden" name="date" value="<?= e(date('Y-m-d')) ?>">
+        <button class="btn btn-secondary btn-sm" title="Coletar dados de hoje (parcial)"><i class="bi bi-arrow-clockwise"></i> Coletar hoje</button>
+      <?php elseif ($period === '1d'): ?>
+        <button class="btn btn-secondary btn-sm" title="Coletar dados de ontem"><i class="bi bi-arrow-clockwise"></i> Coletar</button>
+      <?php else: ?>
+        <button class="btn btn-secondary btn-sm" title="Coletar dados de ontem"><i class="bi bi-arrow-clockwise"></i> Coletar</button>
+      <?php endif; ?>
     </form>
   </div>
 </div>
