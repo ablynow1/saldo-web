@@ -6,10 +6,10 @@ $accountId = (int) ($_GET['account'] ?? 0);
 $period    = $_GET['period'] ?? '7d';
 
 $periodMap = [
-    '1d'  => ['label' => 'Ontem',        'since' => date('Y-m-d', strtotime('-1 day')),   'until' => date('Y-m-d', strtotime('-1 day'))],
-    '7d'  => ['label' => '7 dias',       'since' => date('Y-m-d', strtotime('-7 days')),  'until' => date('Y-m-d', strtotime('-1 day'))],
-    '14d' => ['label' => '14 dias',      'since' => date('Y-m-d', strtotime('-14 days')), 'until' => date('Y-m-d', strtotime('-1 day'))],
-    '30d' => ['label' => '30 dias',      'since' => date('Y-m-d', strtotime('-30 days')), 'until' => date('Y-m-d', strtotime('-1 day'))],
+    '1d'  => ['label' => 'Ontem',   'since' => date('Y-m-d', strtotime('-1 day')),   'until' => date('Y-m-d', strtotime('-1 day'))],
+    '7d'  => ['label' => '7 dias',  'since' => date('Y-m-d', strtotime('-7 days')),  'until' => date('Y-m-d', strtotime('-1 day'))],
+    '14d' => ['label' => '14 dias', 'since' => date('Y-m-d', strtotime('-14 days')), 'until' => date('Y-m-d', strtotime('-1 day'))],
+    '30d' => ['label' => '30 dias', 'since' => date('Y-m-d', strtotime('-30 days')), 'until' => date('Y-m-d', strtotime('-1 day'))],
 ];
 $p     = $periodMap[$period] ?? $periodMap['7d'];
 $since = $p['since'];
@@ -100,22 +100,61 @@ $fmtM = fn(?float $v) => $v !== null && $v > 0
     : '—';
 $fmtN = fn($v, int $dec = 2) => $v ? number_format((float)$v, $dec) : '—';
 
+/**
+ * Sparkline SVG generator.
+ */
+function lux_spark(array $values, string $rgb = '255,255,255'): string {
+    if (count($values) < 2) $values = [3,2,4,3,5,4,6,5,7,6,8,9];
+    $w = 240; $h = 80;
+    $max = max($values); $min = min($values);
+    $range = $max - $min ?: 1;
+    $count = count($values);
+    $points = [];
+    foreach ($values as $i => $v) {
+        $x = ($i / ($count - 1)) * $w;
+        $y = $h - (($v - $min) / $range) * ($h * 0.65) - ($h * 0.18);
+        $points[] = round($x, 2) . ',' . round($y, 2);
+    }
+    $linePath = 'M' . implode(' L', $points);
+    $fillPath = $linePath . " L{$w},{$h} L0,{$h} Z";
+    $id = 'spk' . substr(md5(implode(',', $values).$rgb), 0, 8);
+    $svg  = '<svg viewBox="0 0 '.$w.' '.$h.'" preserveAspectRatio="none" class="lux-kpi-spark">';
+    $svg .= '<defs><linearGradient id="'.$id.'" x1="0" x2="0" y1="0" y2="1">';
+    $svg .= '<stop offset="0%" stop-color="rgb('.$rgb.')" stop-opacity="0.32"/>';
+    $svg .= '<stop offset="100%" stop-color="rgb('.$rgb.')" stop-opacity="0"/>';
+    $svg .= '</linearGradient></defs>';
+    $svg .= '<path d="'.$fillPath.'" fill="url(#'.$id.')"/>';
+    $svg .= '<path d="'.$linePath.'" fill="none" stroke="rgb('.$rgb.')" stroke-opacity="0.55" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>';
+    $svg .= '</svg>';
+    return $svg;
+}
+
+// Spark series from real chart data (or fallback)
+$sparkSpend = []; $sparkRoas = []; $sparkConv = [];
+foreach ($chartData as $r) {
+    $sparkSpend[] = $r['spend'];
+    $sparkRoas[]  = $r['roas'];
+    $sparkConv[]  = $r['conv'];
+}
+
 $title = 'Performance · SALDO WEB';
 ob_start();
 ?>
 
-<!-- Page Header -->
-<div class="page-header">
-  <div>
-    <h1 class="page-title">📈 Performance</h1>
-    <p class="page-subtitle">Campanhas e métricas de anúncios</p>
+<!-- ═══════════════════ HERO ═══════════════════ -->
+<div class="lux-hero">
+  <div class="lux-hero-l">
+    <h1 class="lux-hero-title">Performance</h1>
+    <div class="lux-hero-meta">
+      <?php if ($account): ?>
+        <span class="lux-chip"><i class="bi bi-person"></i> <?= e($account['client_name']) ?></span>
+        <span class="lux-chip"><i class="bi bi-link-45deg"></i> <?= e($account['account_name'] ?: $account['ad_account_id']) ?></span>
+      <?php endif; ?>
+      <span class="lux-chip"><i class="bi bi-calendar3"></i> <?= e($p['label']) ?></span>
+    </div>
   </div>
-  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-    <form method="post" action="<?= e(base_url('run_collect.php')) ?>">
-      <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
-      <button class="btn btn-secondary btn-sm" title="Coleta dados de ontem da API Meta"><i class="bi bi-arrow-clockwise"></i> Coletar dados</button>
-    </form>
-    <select class="form-select form-select-sm" style="width:auto;min-width:200px"
+  <div class="lux-hero-actions">
+    <select class="form-select form-select-sm" style="width:auto;min-width:220px"
             onchange="window.location='performance.php?account='+this.value+'&period=<?= e($period) ?>'">
       <?php foreach ($accounts as $a): ?>
         <option value="<?= (int)$a['id'] ?>" <?= $a['id']==$accountId?'selected':'' ?>>
@@ -123,69 +162,153 @@ ob_start();
         </option>
       <?php endforeach; ?>
     </select>
-    <div class="segmented">
+    <div class="lux-segmented">
       <?php foreach ($periodMap as $key => $pi): ?>
         <a href="performance.php?account=<?= $accountId ?>&period=<?= $key ?>"
-           class="segmented-item <?= $key===$period?'active':'' ?>"><?= $pi['label'] ?></a>
+           class="lux-segmented-item <?= $key===$period?'active':'' ?>"><?= $pi['label'] ?></a>
       <?php endforeach; ?>
     </div>
+    <form method="post" action="<?= e(base_url('run_collect.php')) ?>">
+      <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+      <button class="btn btn-secondary btn-sm" title="Coletar dados de ontem"><i class="bi bi-arrow-clockwise"></i> Coletar</button>
+    </form>
   </div>
 </div>
 
 <?php if (!$account): ?>
-<div class="empty-state">
-  <div class="empty-icon">🔗</div>
-  <div class="empty-title">Nenhuma conta disponível</div>
-  <div class="empty-desc">Cadastre uma conta Meta Ads para visualizar as métricas.</div>
-  <a href="accounts.php" class="btn btn-primary" style="margin-top:4px">Adicionar conta</a>
+<div class="lux-empty">
+  <div class="lux-empty-icon"><i class="bi bi-link-45deg"></i></div>
+  <div class="lux-empty-title">Nenhuma conta disponível</div>
+  <div class="lux-empty-desc">Cadastre uma conta Meta Ads para começar a visualizar campanhas e métricas em tempo real.</div>
+  <a href="accounts.php" class="btn btn-primary" style="margin-top:6px"><i class="bi bi-plus-lg"></i> Adicionar conta</a>
 </div>
 <?php else: ?>
+
 <?php $curr = $account['currency'] ?: 'BRL'; ?>
 
-<!-- KPI Cards -->
-<div class="grid grid-4" style="margin-bottom:24px">
-  <?php
-  $roas = (float)($summary['roas']??0);
-  $roasCls = $roas >= 4 ? 'color:var(--green)' : ($roas >= 2 ? 'color:var(--blue)' : ($roas > 0 ? 'color:var(--red)' : ''));
-  $kpis = [
-    ['Gasto total',   $fmtM((float)($summary['spend']??0)),    'accent-blue',   '💸'],
-    ['Receita',       $fmtM((float)($summary['revenue']??0)),  'accent-green',  '💰'],
-    ['ROAS',          ($roas>0?number_format($roas,2).'x':'—'),'accent-blue',   '📊', $roasCls],
-    ['Conversões',    $fmtN($summary['conversions']??0, 0),    'accent-purple', '🎯'],
-    ['CPA',           $fmtM((float)($summary['cpa']??0)),      'accent-orange', '🎯'],
-    ['CTR',           $fmtN($summary['ctr']??0).'%',           'accent-blue',   '👁'],
-    ['Cliques',       $fmtN($summary['clicks']??0, 0),         'accent-green',  '🖱'],
-    ['Impressões',    number_format((int)($summary['impressions']??0),0,',','.'), 'accent-gray', '👀'],
-  ];
-  foreach ($kpis as $k): ?>
-  <div class="metric-card">
-    <div class="top-row">
-      <div>
-        <div class="metric-label"><?= $k[0] ?></div>
-        <div class="metric-value sm" style="<?= $k[4] ?? '' ?>"><?= $k[1] ?></div>
+<?php
+$roas = (float)($summary['roas'] ?? 0);
+$roasCls = $roas >= 4 ? 'good' : ($roas >= 2 ? '' : ($roas > 0 ? 'crit' : ''));
+?>
+
+<!-- ═══════════════════ HERO KPIs (3) ═══════════════════ -->
+<div class="lux-grid lux-grid-3">
+
+  <div class="lux-kpi hero">
+    <?= lux_spark($sparkSpend ?: [10,12,9,15,14,18,16,22], '255,255,255') ?>
+    <div class="lux-kpi-content">
+      <div class="lux-kpi-header">
+        <span class="lux-kpi-label">Gasto total</span>
+        <div class="lux-kpi-icon"><i class="bi bi-cash-stack"></i></div>
       </div>
-      <div class="metric-icon <?= $k[2] ?>"><?= $k[3] ?></div>
+      <div class="lux-kpi-value"><?= $fmtM((float)($summary['spend']??0)) ?></div>
+      <div class="lux-kpi-sub">no período · <?= e($p['label']) ?></div>
     </div>
   </div>
-  <?php endforeach; ?>
+
+  <div class="lux-kpi hero">
+    <?= lux_spark($sparkSpend ?: [4,5,6,5,8,7,9,11], '74,222,128') ?>
+    <div class="lux-kpi-content">
+      <div class="lux-kpi-header">
+        <span class="lux-kpi-label">Receita</span>
+        <div class="lux-kpi-icon"><i class="bi bi-graph-up-arrow"></i></div>
+      </div>
+      <div class="lux-kpi-value"><?= $fmtM((float)($summary['revenue']??0)) ?></div>
+      <div class="lux-kpi-sub">faturamento atribuído</div>
+    </div>
+  </div>
+
+  <div class="lux-kpi hero">
+    <?= lux_spark($sparkRoas ?: [1.2,2,1.8,2.5,3,2.8,3.5,4], $roas>=4?'74,222,128':($roas>=2?'255,255,255':'248,113,113')) ?>
+    <div class="lux-kpi-content">
+      <div class="lux-kpi-header">
+        <span class="lux-kpi-label">ROAS</span>
+        <div class="lux-kpi-icon"><i class="bi bi-bullseye"></i></div>
+      </div>
+      <div class="lux-kpi-value <?= $roasCls ?>"><?= $roas > 0 ? number_format($roas, 2) . 'x' : '—' ?></div>
+      <div class="lux-kpi-sub <?= $roas >= 2 ? 'up' : ($roas > 0 ? 'down' : '') ?>"><?= $roas >= 4 ? 'performance excepcional' : ($roas >= 2 ? 'performance saudável' : ($roas > 0 ? 'abaixo do esperado' : 'sem dados')) ?></div>
+    </div>
+  </div>
+
 </div>
 
-<!-- Daily Chart -->
+<!-- ═══════════════════ SECONDARY KPIs (5) ═══════════════════ -->
+<div class="lux-grid lux-grid-5" style="margin-top:14px">
+
+  <div class="lux-kpi">
+    <div class="lux-kpi-content">
+      <div class="lux-kpi-header">
+        <span class="lux-kpi-label">Conversões</span>
+        <div class="lux-kpi-icon"><i class="bi bi-check-circle"></i></div>
+      </div>
+      <div class="lux-kpi-value sm"><?= $fmtN($summary['conversions']??0, 0) ?></div>
+    </div>
+  </div>
+
+  <div class="lux-kpi">
+    <div class="lux-kpi-content">
+      <div class="lux-kpi-header">
+        <span class="lux-kpi-label">CPA</span>
+        <div class="lux-kpi-icon"><i class="bi bi-tag"></i></div>
+      </div>
+      <div class="lux-kpi-value sm"><?= $fmtM((float)($summary['cpa']??0)) ?></div>
+    </div>
+  </div>
+
+  <div class="lux-kpi">
+    <div class="lux-kpi-content">
+      <div class="lux-kpi-header">
+        <span class="lux-kpi-label">CTR</span>
+        <div class="lux-kpi-icon"><i class="bi bi-cursor"></i></div>
+      </div>
+      <div class="lux-kpi-value sm"><?= $fmtN($summary['ctr']??0) ?>%</div>
+    </div>
+  </div>
+
+  <div class="lux-kpi">
+    <div class="lux-kpi-content">
+      <div class="lux-kpi-header">
+        <span class="lux-kpi-label">Cliques</span>
+        <div class="lux-kpi-icon"><i class="bi bi-hand-index"></i></div>
+      </div>
+      <div class="lux-kpi-value sm"><?= $fmtN($summary['clicks']??0, 0) ?></div>
+    </div>
+  </div>
+
+  <div class="lux-kpi">
+    <div class="lux-kpi-content">
+      <div class="lux-kpi-header">
+        <span class="lux-kpi-label">Impressões</span>
+        <div class="lux-kpi-icon"><i class="bi bi-eye"></i></div>
+      </div>
+      <div class="lux-kpi-value sm"><?= number_format((int)($summary['impressions']??0),0,',','.') ?></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════════ DAILY CHART ═══════════════════ -->
 <?php if (!empty($chartData)): ?>
-<div class="card" style="margin-bottom:24px">
-  <div class="card-header">
-    <span class="card-header-title">Evolução diária</span>
-  </div>
-  <div class="card-body">
-    <canvas id="chartPerf" height="70"></canvas>
-  </div>
+<div class="lux-section">
+  <h2 class="lux-section-title">
+    Evolução diária
+    <span class="lux-section-title-meta"><?= count($chartData) ?> dias</span>
+  </h2>
+</div>
+<div class="lux-card">
+  <canvas id="chartPerf" height="86"></canvas>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
 (function(){
   const data = <?= json_encode($chartData) ?>;
   const labels = data.map(r => r.date);
-  Chart.defaults.font.family = "'Inter', sans-serif";
+
+  // Dark luxury theme defaults
+  Chart.defaults.font.family = "'Inter', -apple-system, sans-serif";
+  Chart.defaults.color = 'rgba(255,255,255,0.45)';
+  Chart.defaults.borderColor = 'rgba(255,255,255,0.05)';
+
   new Chart(document.getElementById('chartPerf'), {
     type: 'bar',
     data: {
@@ -193,23 +316,26 @@ ob_start();
       datasets: [
         {
           label: 'Gasto',
-          data: data.map(r=>r.spend),
-          backgroundColor: 'rgba(0,122,255,.15)',
-          borderColor: 'rgba(0,122,255,.6)',
-          borderWidth: 1.5,
+          data: data.map(r => r.spend),
+          backgroundColor: 'rgba(255,255,255,0.10)',
+          borderColor: 'rgba(255,255,255,0.35)',
+          borderWidth: 1,
           borderRadius: 6,
-          yAxisID: 'y'
+          yAxisID: 'y',
+          hoverBackgroundColor: 'rgba(255,255,255,0.18)'
         },
         {
           label: 'ROAS',
-          data: data.map(r=>r.roas),
+          data: data.map(r => r.roas),
           type: 'line',
-          borderColor: '#34C759',
-          backgroundColor: 'rgba(52,199,89,.08)',
-          tension: .35,
+          borderColor: 'rgba(74,222,128,0.85)',
+          backgroundColor: 'rgba(74,222,128,0.08)',
+          tension: 0.38,
           yAxisID: 'y2',
           fill: true,
-          pointBackgroundColor: '#34C759',
+          pointBackgroundColor: '#4ADE80',
+          pointBorderColor: 'rgba(8,10,15,1)',
+          pointBorderWidth: 2,
           pointRadius: 4,
           pointHoverRadius: 6,
           borderWidth: 2.5
@@ -220,21 +346,48 @@ ob_start();
       responsive: true,
       interaction: { mode: 'index', intersect: false },
       plugins: {
-        legend: { position: 'top', labels: { font: { family: "'Inter', sans-serif", size: 12, weight: '600' }, usePointStyle: true, boxWidth: 8 } }
+        legend: {
+          position: 'top',
+          align: 'end',
+          labels: {
+            font: { family: "'Inter', sans-serif", size: 11, weight: '600' },
+            color: 'rgba(255,255,255,0.65)',
+            usePointStyle: true,
+            boxWidth: 8,
+            padding: 14
+          }
+        },
+        tooltip: {
+          backgroundColor: 'rgba(13,15,22,0.95)',
+          titleColor: 'rgba(255,255,255,0.95)',
+          bodyColor: 'rgba(255,255,255,0.75)',
+          borderColor: 'rgba(255,255,255,0.10)',
+          borderWidth: 1,
+          padding: 12,
+          cornerRadius: 10,
+          titleFont: { weight: '700', size: 12 },
+          bodyFont: { size: 12 },
+          boxPadding: 6
+        }
       },
       scales: {
-        x: { grid: { display: false }, ticks: { font: { size: 12 } } },
+        x: {
+          grid: { display: false, drawBorder: false },
+          ticks: { font: { size: 11 }, color: 'rgba(255,255,255,0.40)' }
+        },
         y: {
           position: 'left',
-          title: { display: true, text: 'Gasto (<?= $curr ?>)', font: { size: 11, weight: '600' } },
-          grid: { color: 'rgba(0,0,0,.04)' },
-          ticks: { font: { size: 11 } }
+          title: { display: true, text: 'Gasto (<?= $curr ?>)', font: { size: 10, weight: '600' }, color: 'rgba(255,255,255,0.30)' },
+          grid: { color: 'rgba(255,255,255,0.04)', drawBorder: false },
+          border: { display: false },
+          ticks: { font: { size: 11 }, color: 'rgba(255,255,255,0.40)' }
         },
         y2: {
           position: 'right',
-          title: { display: true, text: 'ROAS', font: { size: 11, weight: '600' } },
-          grid: { drawOnChartArea: false },
-          ticks: { font: { size: 11 } }
+          title: { display: true, text: 'ROAS', font: { size: 10, weight: '600' }, color: 'rgba(255,255,255,0.30)' },
+          grid: { drawOnChartArea: false, drawBorder: false },
+          border: { display: false },
+          ticks: { font: { size: 11 }, color: 'rgba(255,255,255,0.40)' }
         }
       }
     }
@@ -243,118 +396,130 @@ ob_start();
 </script>
 <?php endif; ?>
 
-<!-- Campaigns Table -->
+<!-- ═══════════════════ CAMPAIGNS ═══════════════════ -->
 <?php if (!empty($campaigns)): ?>
-<div class="card" style="margin-bottom:24px">
-  <div class="card-header">
-    <span class="card-header-title">Campanhas</span>
-    <span style="font-size:12px;color:var(--text-4)"><?= count($campaigns) ?> campanhas</span>
-  </div>
-  <div class="table-wrap" style="border:none;border-radius:0;box-shadow:none">
-    <table>
-      <thead>
-        <tr>
-          <th>Campanha</th>
-          <th style="text-align:right">Gasto</th>
-          <th style="text-align:right">Receita</th>
-          <th style="text-align:right">ROAS</th>
-          <th style="text-align:right">Conv.</th>
-          <th style="text-align:right">CPA</th>
-          <th style="text-align:right">CTR</th>
-        </tr>
-      </thead>
-      <tbody>
-      <?php foreach ($campaigns as $c):
-        $rv = (float)($c['roas']??0);
-        $rc = $rv>=4?'good':($rv>=2?'ok':($rv>0&&$rv<1?'bad':''));
-      ?>
-        <tr>
-          <td style="max-width:280px">
-            <div style="font-weight:600;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><?= e($c['campaign_name'] ?: $c['campaign_id']) ?></div>
-          </td>
-          <td style="text-align:right;font-weight:600"><?= $fmtM((float)$c['spend']) ?></td>
-          <td style="text-align:right"><?= $fmtM((float)($c['revenue']??0)) ?></td>
-          <td style="text-align:right">
-            <?php if ($rv > 0): ?>
-              <span style="font-weight:700;color:<?= $rv>=4?'var(--green)':($rv>=2?'var(--blue)':'var(--red)') ?>"><?= number_format($rv,2) ?>x</span>
-            <?php else: ?>—<?php endif; ?>
-          </td>
-          <td style="text-align:right"><?= (int)($c['conversions']??0) ?: '—' ?></td>
-          <td style="text-align:right"><?= $fmtM((float)($c['cpa']??0)) ?></td>
-          <td style="text-align:right"><?= $fmtN($c['ctr']??0) ?>%</td>
-        </tr>
-      <?php endforeach; ?>
-      </tbody>
-    </table>
-  </div>
+<div class="lux-section">
+  <h2 class="lux-section-title">
+    Campanhas
+    <span class="lux-section-title-meta"><?= count($campaigns) ?> ativas</span>
+  </h2>
+</div>
+<div class="lux-table-wrap">
+  <table class="lux-table">
+    <thead>
+      <tr>
+        <th>Campanha</th>
+        <th class="lux-td-r">Gasto</th>
+        <th class="lux-td-r">Receita</th>
+        <th class="lux-td-r">ROAS</th>
+        <th class="lux-td-r">Conv.</th>
+        <th class="lux-td-r">CPA</th>
+        <th class="lux-td-r">CTR</th>
+      </tr>
+    </thead>
+    <tbody>
+    <?php foreach ($campaigns as $c):
+      $rv = (float)($c['roas']??0);
+      $rcls = $rv>=4?'good':($rv>=2?'':($rv>0?'bad':'dim'));
+    ?>
+      <tr>
+        <td style="max-width:300px">
+          <div class="lux-td-primary" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><?= e($c['campaign_name'] ?: $c['campaign_id']) ?></div>
+        </td>
+        <td class="lux-td-r"><span class="lux-td-num strong"><?= $fmtM((float)$c['spend']) ?></span></td>
+        <td class="lux-td-r"><span class="lux-td-num"><?= $fmtM((float)($c['revenue']??0)) ?></span></td>
+        <td class="lux-td-r">
+          <?php if ($rv > 0): ?>
+            <span class="lux-td-num <?= $rcls ?>"><?= number_format($rv,2) ?>x</span>
+          <?php else: ?>
+            <span class="lux-td-num dim">—</span>
+          <?php endif; ?>
+        </td>
+        <td class="lux-td-r"><span class="lux-td-num"><?= (int)($c['conversions']??0) ?: '—' ?></span></td>
+        <td class="lux-td-r"><span class="lux-td-num"><?= $fmtM((float)($c['cpa']??0)) ?></span></td>
+        <td class="lux-td-r"><span class="lux-td-num"><?= $fmtN($c['ctr']??0) ?>%</span></td>
+      </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
 </div>
 <?php endif; ?>
 
-<!-- Top Ads -->
+<!-- ═══════════════════ TOP ADS ═══════════════════ -->
 <?php if (!empty($topAds)): ?>
-<div class="card" style="margin-bottom:24px">
-  <div class="card-header">
-    <span class="card-header-title">Top anúncios por ROAS</span>
-    <span style="font-size:12px;color:var(--text-4)"><?= $p['label'] ?></span>
-  </div>
-  <div class="table-wrap" style="border:none;border-radius:0;box-shadow:none">
-    <table>
-      <thead>
-        <tr>
-          <th>Criativo</th>
-          <th>Campanha</th>
-          <th style="text-align:right">Gasto</th>
-          <th style="text-align:right">ROAS</th>
-          <th style="text-align:right">CPA</th>
-          <th style="text-align:right">CTR</th>
-          <th style="text-align:right">Conv.</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-      <?php foreach ($topAds as $ad):
-        $rv = (float)($ad['roas']??0);
-        $status = $ad['effective_status'] ?? '';
-        $stDot = match($status) { 'ACTIVE'=>'status-active','PAUSED'=>'status-paused','DISAPPROVED'=>'status-blocked', default=>'status-paused' };
-        $stLabel = match($status) { 'ACTIVE'=>'Ativo','PAUSED'=>'Pausado','DISAPPROVED'=>'Reprovado', default=>($status?:'-') };
-      ?>
-        <tr>
-          <td style="max-width:240px">
-            <div style="display:flex;align-items:center;gap:10px">
+<div class="lux-section">
+  <h2 class="lux-section-title">
+    Top anúncios por ROAS
+    <span class="lux-section-title-meta"><?= e($p['label']) ?> · <?= count($topAds) ?> criativos</span>
+  </h2>
+</div>
+<div class="lux-table-wrap">
+  <table class="lux-table">
+    <thead>
+      <tr>
+        <th>Criativo</th>
+        <th>Campanha</th>
+        <th class="lux-td-r">Gasto</th>
+        <th class="lux-td-r">ROAS</th>
+        <th class="lux-td-r">CPA</th>
+        <th class="lux-td-r">CTR</th>
+        <th class="lux-td-r">Conv.</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+    <?php foreach ($topAds as $ad):
+      $rv = (float)($ad['roas']??0);
+      $rcls = $rv>=4?'good':($rv>=2?'':($rv>0?'bad':'dim'));
+      $status = $ad['effective_status'] ?? '';
+      $stCls = match($status) { 'ACTIVE'=>'live','PAUSED'=>'dim','DISAPPROVED'=>'crit', default=>'dim' };
+      $stLabel = match($status) { 'ACTIVE'=>'Ativo','PAUSED'=>'Pausado','DISAPPROVED'=>'Reprovado', default=>($status?:'—') };
+    ?>
+      <tr>
+        <td>
+          <div class="lux-ad">
+            <div class="lux-ad-thumb">
               <?php if ($ad['thumbnail_url']): ?>
-                <img src="<?= e($ad['thumbnail_url']) ?>" width="36" height="36"
-                     style="object-fit:cover;border-radius:var(--radius-xs);flex-shrink:0"
-                     onerror="this.style.display='none'">
+                <img src="<?= e($ad['thumbnail_url']) ?>" alt="" onerror="this.style.display='none';this.parentNode.innerHTML='<i class=\'bi bi-image\'></i>'">
               <?php else: ?>
-                <div style="width:36px;height:36px;background:var(--surface-3);border-radius:var(--radius-xs);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px">🖼️</div>
+                <i class="bi bi-image"></i>
               <?php endif; ?>
-              <div style="font-size:13px;font-weight:600;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><?= e($ad['ad_name'] ?? '—') ?></div>
             </div>
-          </td>
-          <td><div style="font-size:12.5px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px"><?= e($ad['campaign_name'] ?? '—') ?></div></td>
-          <td style="text-align:right;font-weight:600"><?= $fmtM((float)$ad['spend']) ?></td>
-          <td style="text-align:right">
-            <?php if ($rv > 0): ?>
-              <span style="font-weight:700;color:<?= $rv>=4?'var(--green)':($rv>=2?'var(--blue)':'var(--red)') ?>"><?= number_format($rv,2) ?>x</span>
-            <?php else: ?>—<?php endif; ?>
-          </td>
-          <td style="text-align:right"><?= $fmtM((float)($ad['cpa']??0)) ?></td>
-          <td style="text-align:right"><?= $fmtN($ad['ctr']??0) ?>%</td>
-          <td style="text-align:right"><?= (int)($ad['conversions']??0) ?: '—' ?></td>
-          <td><span class="status-dot <?= $stDot ?>"><?= $stLabel ?></span></td>
-        </tr>
-      <?php endforeach; ?>
-      </tbody>
-    </table>
-  </div>
+            <div class="lux-ad-body">
+              <div class="lux-ad-name"><?= e($ad['ad_name'] ?? '—') ?></div>
+              <?php if (!empty($ad['adset_name'])): ?>
+                <div class="lux-ad-camp"><?= e($ad['adset_name']) ?></div>
+              <?php endif; ?>
+            </div>
+          </div>
+        </td>
+        <td>
+          <div style="font-size:12px;color:rgba(255,255,255,0.55);max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><?= e($ad['campaign_name'] ?? '—') ?></div>
+        </td>
+        <td class="lux-td-r"><span class="lux-td-num strong"><?= $fmtM((float)$ad['spend']) ?></span></td>
+        <td class="lux-td-r">
+          <?php if ($rv > 0): ?>
+            <span class="lux-td-num <?= $rcls ?>"><?= number_format($rv,2) ?>x</span>
+          <?php else: ?>
+            <span class="lux-td-num dim">—</span>
+          <?php endif; ?>
+        </td>
+        <td class="lux-td-r"><span class="lux-td-num"><?= $fmtM((float)($ad['cpa']??0)) ?></span></td>
+        <td class="lux-td-r"><span class="lux-td-num"><?= $fmtN($ad['ctr']??0) ?>%</span></td>
+        <td class="lux-td-r"><span class="lux-td-num"><?= (int)($ad['conversions']??0) ?: '—' ?></span></td>
+        <td><span class="lux-dot <?= e($stCls) ?>"><?= e($stLabel) ?></span></td>
+      </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
 </div>
 <?php endif; ?>
 
 <?php if (empty($campaigns) && empty($topAds)): ?>
-<div class="empty-state">
-  <div class="empty-icon">📊</div>
-  <div class="empty-title">Sem dados para este período</div>
-  <div class="empty-desc">Execute a coleta de insights para visualizar as métricas:<br><code style="font-family:monospace;font-size:12px;background:var(--surface-3);padding:4px 8px;border-radius:6px;display:inline-block;margin-top:8px">php cron/collect_insights.php</code></div>
+<div class="lux-empty">
+  <div class="lux-empty-icon"><i class="bi bi-bar-chart"></i></div>
+  <div class="lux-empty-title">Sem dados para este período</div>
+  <div class="lux-empty-desc">Execute a coleta de insights para visualizar campanhas e métricas:<br><code style="margin-top:8px;display:inline-block">php cron/collect_insights.php</code></div>
 </div>
 <?php endif; ?>
 
