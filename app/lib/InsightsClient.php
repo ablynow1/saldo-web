@@ -66,6 +66,10 @@ final class InsightsClient
      * Coleta insights por anúncio (nível "ad") de uma conta, para um período.
      * Salva/atualiza na tabela ad_insights.
      *
+     * Auto-cleanup: ao iniciar, deleta linhas com date_start != date_stop
+     * (registros agregados de versões antigas que inflavam SUM em queries
+     * de período).
+     *
      * @param int    $metaAccountDbId  ID interno (tabela meta_accounts)
      * @param string $adAccountId      ID da conta no Meta (sem "act_")
      * @param string $datePreset       'yesterday', 'today', 'last_7d', 'last_30d'
@@ -81,6 +85,8 @@ final class InsightsClient
         ?string $since = null,
         ?string $until = null
     ): array {
+        // Auto-cleanup de rows agregadas corruptas (idempotente, custo desprezível)
+        $this->cleanupCorruptedRows($metaAccountDbId);
         $fields = implode(',', [
             'ad_id', 'ad_name', 'adset_id', 'adset_name', 'campaign_id', 'campaign_name',
             'spend', 'impressions', 'clicks', 'reach',
@@ -239,7 +245,196 @@ final class InsightsClient
         ];
     }
 
+    /**
+     * BUSCA LIVE — não toca em DB.
+     *
+     * Faz a chamada à Meta API para o período e retorna os dados agregados
+     * exatamente como o Gerenciador de Anúncios mostra. Use isto para
+     * geração de relatórios (Dia / Semana / Mês / Personalizado) — assim
+     * os números batem 100% com o que o cliente vê na Meta, sem dependência
+     * de cache que pode estar dessincronizado.
+     *
+     * @param string $adAccountId  ID da conta sem "act_"
+     * @param string $since        YYYY-MM-DD
+     * @param string $until        YYYY-MM-DD
+     * @return array{
+     *   summary: array,
+     *   campaigns: array<int, array>,
+     *   period: array{since:string, until:string}
+     * }
+     */
+    public function fetchAccountReport(string $adAccountId, string $since, string $until): array
+    {
+        $fields = 'campaign_id,campaign_name,spend,impressions,clicks,reach,actions,action_values';
+
+        // SEM time_increment — queremos a agregação do período (igual ao gerenciador)
+        $params = [
+            'fields'                          => $fields,
+            'level'                           => 'campaign',
+            'access_token'                    => $this->token,
+            'limit'                           => 500,
+            'time_range'                      => json_encode(['since' => $since, 'until' => $until]),
+            'use_unified_attribution_setting' => 'true',
+            'action_attribution_windows'      => json_encode($this->attributionWindows),
+        ];
+
+        $url = sprintf(
+            'https://graph.facebook.com/%s/act_%s/insights?%s',
+            $this->apiVersion,
+            urlencode($adAccountId),
+            http_build_query($params)
+        );
+
+        $campaigns = [];
+        $sum = [
+            'spend' => 0.0, 'impressions' => 0, 'clicks' => 0, 'reach' => 0,
+            'conversions' => 0, 'conversion_value' => 0.0, 'leads' => 0,
+            'landing_page_views' => 0, 'adds_to_cart' => 0, 'initiates_checkout' => 0,
+        ];
+
+        $nextPage = $url;
+        while ($nextPage) {
+            $resp = HttpClient::get($nextPage);
+            if ($resp['status'] >= 400) {
+                throw new RuntimeException('Meta insights error: ' . ($resp['body']['error']['message'] ?? 'HTTP ' . $resp['status']));
+            }
+            $rows     = $resp['body']['data']           ?? [];
+            $nextPage = $resp['body']['paging']['next'] ?? null;
+
+            foreach ($rows as $row) {
+                $m = $this->parseRow($row);
+
+                $cSpend = (float) ($row['spend'] ?? 0);
+                $cImp   = (int)   ($row['impressions'] ?? 0);
+                $cClk   = (int)   ($row['clicks'] ?? 0);
+
+                $cCtr = $cImp > 0 ? ($cClk / $cImp) * 100 : 0;
+                $cCpc = $cClk > 0 ? $cSpend / $cClk : 0;
+                $cCpm = $cImp > 0 ? ($cSpend / $cImp) * 1000 : 0;
+                $cCpa = $m['conversions'] > 0 ? $cSpend / $m['conversions'] : 0;
+                $cRoas = $cSpend > 0 && $m['conversionValue'] > 0 ? $m['conversionValue'] / $cSpend : 0;
+
+                $campaigns[] = [
+                    'campaign_id'        => $row['campaign_id'] ?? null,
+                    'campaign_name'      => $row['campaign_name'] ?? 'Sem nome',
+                    'spend'              => $cSpend,
+                    'impressions'        => $cImp,
+                    'clicks'             => $cClk,
+                    'reach'              => (int) ($row['reach'] ?? 0),
+                    'conversions'        => $m['conversions'],
+                    'conversion_value'   => $m['conversionValue'],
+                    'leads'              => $m['leads'],
+                    'landing_page_views' => $m['landingPageViews'],
+                    'adds_to_cart'       => $m['addsToCart'],
+                    'initiates_checkout' => $m['initiatesCheckout'],
+                    'ctr'                => $cCtr,
+                    'cpc'                => $cCpc,
+                    'cpm'                => $cCpm,
+                    'cpa'                => $cCpa,
+                    'roas'               => $cRoas,
+                ];
+
+                $sum['spend']              += $cSpend;
+                $sum['impressions']        += $cImp;
+                $sum['clicks']             += $cClk;
+                $sum['reach']              += (int) ($row['reach'] ?? 0);
+                $sum['conversions']        += $m['conversions'];
+                $sum['conversion_value']   += $m['conversionValue'];
+                $sum['leads']              += $m['leads'];
+                $sum['landing_page_views'] += $m['landingPageViews'];
+                $sum['adds_to_cart']       += $m['addsToCart'];
+                $sum['initiates_checkout'] += $m['initiatesCheckout'];
+            }
+        }
+
+        // Métricas derivadas no nível total (igual o gerenciador faz)
+        $sum['ctr']  = $sum['impressions'] > 0 ? ($sum['clicks'] / $sum['impressions']) * 100 : 0;
+        $sum['cpc']  = $sum['clicks']      > 0 ? $sum['spend'] / $sum['clicks'] : 0;
+        $sum['cpm']  = $sum['impressions'] > 0 ? ($sum['spend'] / $sum['impressions']) * 1000 : 0;
+        $sum['cpa']  = $sum['conversions'] > 0 ? $sum['spend'] / $sum['conversions'] : 0;
+        $sum['roas'] = ($sum['spend'] > 0 && $sum['conversion_value'] > 0)
+            ? $sum['conversion_value'] / $sum['spend']
+            : 0;
+
+        // Ordena campanhas por spend desc (igual o gerenciador)
+        usort($campaigns, fn($a, $b) => $b['spend'] <=> $a['spend']);
+
+        return [
+            'summary'   => $sum,
+            'campaigns' => $campaigns,
+            'period'    => ['since' => $since, 'until' => $until],
+        ];
+    }
+
+    /**
+     * Busca os top N criativos (level=ad) por ROAS para um período.
+     * Usado para destacar os melhores anúncios em relatórios.
+     */
+    public function fetchTopAds(string $adAccountId, string $since, string $until, int $limit = 5): array
+    {
+        $fields = 'ad_id,ad_name,campaign_name,spend,impressions,clicks,actions,action_values,effective_status';
+
+        $params = [
+            'fields'                          => $fields,
+            'level'                           => 'ad',
+            'access_token'                    => $this->token,
+            'limit'                           => 500,
+            'time_range'                      => json_encode(['since' => $since, 'until' => $until]),
+            'use_unified_attribution_setting' => 'true',
+            'action_attribution_windows'      => json_encode($this->attributionWindows),
+            'filtering'                       => json_encode([
+                ['field' => 'spend', 'operator' => 'GREATER_THAN', 'value' => 0]
+            ]),
+        ];
+
+        $url = sprintf(
+            'https://graph.facebook.com/%s/act_%s/insights?%s',
+            $this->apiVersion, urlencode($adAccountId), http_build_query($params)
+        );
+
+        $ads = [];
+        $resp = HttpClient::get($url);
+        if ($resp['status'] >= 400) return [];
+
+        foreach (($resp['body']['data'] ?? []) as $row) {
+            $m = $this->parseRow($row);
+            $spend = (float) ($row['spend'] ?? 0);
+            $roas  = $spend > 0 && $m['conversionValue'] > 0 ? $m['conversionValue'] / $spend : 0;
+            $ads[] = [
+                'ad_id'             => $row['ad_id'] ?? null,
+                'ad_name'           => $row['ad_name'] ?? '—',
+                'campaign_name'     => $row['campaign_name'] ?? '—',
+                'spend'             => $spend,
+                'conversions'       => $m['conversions'],
+                'conversion_value'  => $m['conversionValue'],
+                'roas'              => $roas,
+                'effective_status'  => $row['effective_status'] ?? null,
+            ];
+        }
+
+        usort($ads, fn($a, $b) => $b['roas'] <=> $a['roas']);
+        return array_slice($ads, 0, $limit);
+    }
+
     // ───────────────────────────────── helpers privados ─────────────────────────────────
+
+    /**
+     * Remove rows agregadas corruptas (date_start != date_stop) da conta.
+     * Estas rows existem por causa de versões antigas do coletor que chamavam
+     * a Meta API sem time_increment=1 em time_range multi-dia, fazendo a API
+     * retornar uma linha agregada do período inteiro que era persistida com
+     * unique key (entity_id, date_start), corrompendo o snapshot diário.
+     */
+    private function cleanupCorruptedRows(int $metaAccountDbId): void
+    {
+        try {
+            Db::exec('DELETE FROM ad_insights       WHERE meta_account_id = ? AND date_start != date_stop', [$metaAccountDbId]);
+            Db::exec('DELETE FROM campaign_insights WHERE meta_account_id = ? AND date_start != date_stop', [$metaAccountDbId]);
+        } catch (Throwable $e) {
+            // não bloqueia coleta — só é uma limpeza opportunistic
+        }
+    }
+
 
     /**
      * Parâmetros base aplicados em TODAS as chamadas de insights.

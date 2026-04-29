@@ -76,7 +76,7 @@ if ($useApproval && $hasQueue && $adminWa && $baseUrl && $nowHour === 0 && $nowM
                 $msg = match ($type) {
                     'daily_creatives'  => $reports->buildDailyCreativeReport($account),
                     'weekly_summary'   => $reports->buildWeeklySummary($account),
-                    'monthly_summary'  => $reports->buildWeeklySummary($account, date('Y-m-01', strtotime('-1 month'))),
+                    'monthly_summary'  => $reports->buildMonthlySummary($account),
                     'weekend_forecast' => $reports->buildWeekendForecast($account),
                     'personalizado'    => $reports->buildCustomReport(
                         $account,
@@ -205,7 +205,7 @@ foreach ($schedules as $sched) {
             $msg = match ($type) {
                 'daily_creatives'  => $reports->buildDailyCreativeReport($account),
                 'weekly_summary'   => $reports->buildWeeklySummary($account),
-                'monthly_summary'  => $reports->buildWeeklySummary($account, date('Y-m-01', strtotime('-1 month'))),
+                'monthly_summary'  => $reports->buildMonthlySummary($account),
                 'weekend_forecast' => $reports->buildWeekendForecast($account),
                 'personalizado'    => $reports->buildCustomReport(
                     $account,

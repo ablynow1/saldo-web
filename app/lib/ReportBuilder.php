@@ -3,7 +3,24 @@ declare(strict_types=1);
 
 /**
  * Monta as mensagens de relatório formatadas para WhatsApp.
- * O WhatsApp suporta: *negrito*, _itálico_, ~tachado~, `monoespaçado`
+ *
+ * ARQUITETURA — Live API, sem cache:
+ * ──────────────────────────────────────────────────────────────────────
+ * Todos os relatórios buscam dados DIRETAMENTE da Meta API via
+ * InsightsClient::fetchAccountReport(). Isso garante:
+ *
+ *   1. Paridade 100% com o Gerenciador de Anúncios (mesmos números,
+ *      mesma janela de atribuição, mesmo `omni_purchase`).
+ *   2. Zero dependência do cache (`ad_insights`, `campaign_insights`),
+ *      eliminando qualquer possibilidade de desync entre o que está
+ *      no banco e o que o cliente vê na Meta.
+ *   3. Nenhuma operação manual ("rodar fix") nunca mais é necessária.
+ *
+ * O cache do banco continua sendo usado SOMENTE pelo dashboard de
+ * performance (performance.php) — que prioriza velocidade sobre
+ * frescor absoluto e exibe um aviso de "última coleta em XX:XX".
+ *
+ * WhatsApp suporta: *negrito*, _itálico_, ~tachado~, `monoespaçado`
  */
 final class ReportBuilder
 {
@@ -19,311 +36,111 @@ final class ReportBuilder
         return new self(InsightsClient::fromSettings());
     }
 
-    // ─────────────────────────── RELATÓRIO DIÁRIO DE CRIATIVOS ───────────────────────────
+    // ═════════════════════════ RELATÓRIO DIÁRIO ═════════════════════════
 
     /**
-     * Gera relatório diário de criativos para uma conta.
-     * Inclui: top 3 por ROAS, bottom 3 por CPA, resumo do dia, comparativo vs semana passada.
-     *
-     * @param array $account   Linha da tabela meta_accounts (com client_name)
-     * @param string $date     Data do relatório (padrão: ontem)
+     * Relatório diário de uma conta. Padrão: ontem.
+     * Para hoje passe $date = date('Y-m-d') — vai buscar o parcial.
      */
     public function buildDailyCreativeReport(array $account, ?string $date = null): string
     {
-        $date       = $date ?? date('Y-m-d', strtotime('-1 day'));
-        $dateLabel  = date('d/m/Y', strtotime($date));
-        $accId      = (int) $account['id'];
+        $date      = $date ?? date('Y-m-d', strtotime('-1 day'));
+        $dateLabel = date('d/m/Y', strtotime($date));
+
+        $report = $this->safeFetch($account, $date, $date);
+
+        $isToday   = $date === date('Y-m-d');
+        $titleIcon = '📊';
+        $title     = $isToday ? 'Resumo Parcial de Hoje' : 'Resumo Diário';
+        $periodTxt = $dateLabel;
+
+        return $this->renderReport($account, $report, [
+            'icon'         => $titleIcon,
+            'title'        => $title,
+            'period_label' => $periodTxt,
+            'section_label'=> 'Resultado do Dia',
+            'empty_text'   => $isToday
+                ? 'Nenhuma impressão registrada hoje ainda. Volte mais tarde.'
+                : "Nenhuma impressão registrada em {$dateLabel}.",
+        ]);
+    }
+
+    // ═════════════════════════ RELATÓRIO SEMANAL ═════════════════════════
+
+    /**
+     * Resumo semanal. Padrão: últimos 7 dias completos (ontem - 7).
+     */
+    public function buildWeeklySummary(array $account, ?string $weekStart = null): string
+    {
+        $weekEnd   = date('Y-m-d', strtotime('-1 day'));
+        $weekStart = $weekStart ?? date('Y-m-d', strtotime('-7 days'));
+
+        $report = $this->safeFetch($account, $weekStart, $weekEnd);
+
+        return $this->renderReport($account, $report, [
+            'icon'          => '📅',
+            'title'         => 'Resumo Semanal',
+            'period_label'  => date('d/m', strtotime($weekStart)) . ' a ' . date('d/m', strtotime($weekEnd)),
+            'section_label' => 'Resultado da Semana',
+            'empty_text'    => 'Nenhuma impressão ou gasto registrado nos últimos 7 dias. Verifique se as campanhas estão ativas.',
+        ]);
+    }
+
+    // ═════════════════════════ RELATÓRIO SEMANAL AVANÇADO ═════════════════════════
+
+    /**
+     * Resumo semanal avançado — mesma base, mais detalhamento de funil.
+     */
+    public function buildAdvancedWeeklyReport(array $account, ?string $weekStart = null): string
+    {
+        $weekEnd   = date('Y-m-d', strtotime('-1 day'));
+        $weekStart = $weekStart ?? date('Y-m-d', strtotime('-7 days'));
+
+        $report = $this->safeFetch($account, $weekStart, $weekEnd);
+
         $clientName = $account['client_name'] ?? $account['name'] ?? 'Cliente';
         $accName    = $account['account_name'] ?: ('Conta ' . $account['ad_account_id']);
         $currency   = $account['currency'] ?: 'BRL';
+        $period     = date('d/m', strtotime($weekStart)) . ' a ' . date('d/m', strtotime($weekEnd));
 
-        // Funnel totals from campaign_insights (only campaigns with impressions)
-        $funnel = Db::one(
-            'SELECT
-                SUM(impressions) AS imp, SUM(clicks) AS clk, SUM(spend) AS spend,
-                SUM(landing_page_views) AS lpv,
-                SUM(adds_to_cart) AS atc,
-                SUM(initiates_checkout) AS ic,
-                SUM(conversions) AS conv,
-                SUM(conversion_value) AS revenue
-             FROM campaign_insights
-             WHERE meta_account_id = ? AND date_start = ? AND date_stop = ? AND impressions > 0',
-            [$accId, $date, $date]
-        );
-
-        $spend = (float) ($funnel['spend'] ?? 0);
-        $imp   = (int) ($funnel['imp'] ?? 0);
-
-        if ($imp == 0) {
-            $diaExtenso = ($date === date('Y-m-d')) ? 'hoje' : 'ontem';
-            return sprintf(
-                "📊 *Resumo Diário — %s*\n\n%s · %s\n\nNenhuma impressão ou gasto registrado para %s. Verifique se as campanhas estão ativas.",
-                $clientName, $accName, $dateLabel, $diaExtenso
-            );
+        $s = $report['summary'];
+        if (($s['impressions'] ?? 0) == 0) {
+            return "📊 *Relatório Semanal Avançado — {$clientName}*\n_{$accName}_\n_{$period}_\n\nNenhuma impressão ou gasto registrado nos últimos 7 dias. Verifique se as campanhas estão ativas.";
         }
-
-        $revenue = (float) ($funnel['revenue'] ?? 0);
-        $roas    = $spend > 0 ? $revenue / $spend : 0;
-        $convs   = (int)   ($funnel['conv'] ?? 0);
-        $cpa     = $convs > 0 ? $spend / $convs : 0;
-        $clk     = (int)   ($funnel['clk'] ?? 0);
-        $cpc     = $clk > 0 ? $spend / $clk : 0;
-        $ctr     = $imp > 0 ? ($clk / $imp) * 100 : 0;
-
-        // Todas as campanhas que imprimiram no dia
-        $campaigns = Db::all(
-            'SELECT campaign_name,
-                    SUM(impressions) AS imp, SUM(clicks) AS clk, SUM(spend) AS spend,
-                    SUM(landing_page_views) AS lpv, SUM(adds_to_cart) AS atc,
-                    SUM(initiates_checkout) AS ic, SUM(conversions) AS conv,
-                    SUM(conversion_value) AS revenue
-             FROM campaign_insights
-             WHERE meta_account_id = ? AND date_start = ? AND date_stop = ? AND impressions > 0
-             GROUP BY campaign_name
-             ORDER BY spend DESC',
-            [$accId, $date, $date]
-        );
-
-        $lines = [];
-        $lines[] = "📊 *Resumo Diário — {$clientName}*";
-        $lines[] = "_{$accName} · {$dateLabel}_";
-        $lines[] = '';
-        $lines[] = '💰 *Resultado do Dia*';
-        $lines[] = '• Gasto: *' . $this->fmtMoney($spend, $currency) . '*';
-        $lines[] = '• Receita (Valor de Conversão): *' . $this->fmtMoney($revenue, $currency) . '*';
-        if ($roas > 0) $lines[] = '• ROAS: *' . number_format($roas, 2) . 'x*';
-        $lines[] = '• Compras Realizadas: *' . $convs . '*';
-        if ($cpa > 0) $lines[] = '• CPA: *' . $this->fmtMoney($cpa, $currency) . '*';
-        $lines[] = '• Cliques: *' . $clk . '*';
-        $lines[] = '• CPC: *' . $this->fmtMoney($cpc, $currency) . '*';
-        $lines[] = '• CTR: *' . number_format($ctr, 2) . '%*';
-        $lines[] = '• Visualizações de Página: *' . ($funnel['lpv'] ?? 0) . '*';
-        $lines[] = '• Adições ao Carrinho: *' . ($funnel['atc'] ?? 0) . '*';
-        $lines[] = '• Checkouts Iniciados: *' . ($funnel['ic'] ?? 0) . '*';
-
-        if (!empty($campaigns)) {
-            $lines[] = '';
-            $lines[] = '📈 *Performance por Campanha*';
-            foreach ($campaigns as $c) {
-                $cSpend = (float)($c['spend'] ?? 0);
-                $cRev   = (float)($c['revenue'] ?? 0);
-                $cRoas  = $cSpend > 0 ? $cRev / $cSpend : 0;
-                $cConvs = (int)($c['conv'] ?? 0);
-                $cCpa   = $cConvs > 0 ? $cSpend / $cConvs : 0;
-                $cImp   = (int)($c['imp'] ?? 0);
-                $cClk   = (int)($c['clk'] ?? 0);
-                $cCtr   = $cImp > 0 ? ($cClk / $cImp) * 100 : 0;
-                $cCpc   = $cClk > 0 ? $cSpend / $cClk : 0;
-
-                $lines[] = "• *" . self::truncate($c['campaign_name'] ?? 'Campanha Desconhecida', 50) . "*";
-                $lines[] = '   Gasto: ' . $this->fmtMoney($cSpend, $currency) . ' · Receita: ' . $this->fmtMoney($cRev, $currency) . ' · ROAS: ' . number_format($cRoas, 2) . 'x';
-                $lines[] = '   Cliques: ' . $cClk . ' · CPC: ' . $this->fmtMoney($cCpc, $currency) . ' · CTR: ' . number_format($cCtr, 2) . '%';
-                $lines[] = '   Vis. Página: ' . ($c['lpv'] ?? 0) . ' · Carrinho: ' . ($c['atc'] ?? 0) . ' · Checkout: ' . ($c['ic'] ?? 0) . ' · Compras: ' . $cConvs;
-                $lines[] = ''; // Add a blank line between campaigns for readability
-            }
-        }
-
-        $lines[] = '_Saldo WEB · ' . date('H:i', time()) . '_';
-
-        return implode("\n", $lines);
-    }
-
-    // ──────────────────────────── RELATÓRIO SEMANAL ────────────────────────────
-
-    public function buildWeeklySummary(array $account, ?string $weekStart = null): string
-    {
-        $weekStart = $weekStart ?? date('Y-m-d', strtotime('-7 days'));
-        $weekEnd   = date('Y-m-d', strtotime('-1 day'));
-
-        $accId      = (int) $account['id'];
-        $clientName = $account['client_name'] ?? $account['name'];
-        $accName    = $account['account_name'] ?: ('Conta ' . $account['ad_account_id']);
-        $currency   = $account['currency'] ?: 'BRL';
-
-        $funnel = Db::one(
-            'SELECT
-                SUM(impressions) AS imp, SUM(clicks) AS clk, SUM(spend) AS spend,
-                SUM(landing_page_views) AS lpv,
-                SUM(adds_to_cart) AS atc,
-                SUM(initiates_checkout) AS ic,
-                SUM(conversions) AS conv,
-                SUM(conversion_value) AS revenue
-             FROM campaign_insights
-             WHERE meta_account_id = ? AND date_start >= ? AND date_stop <= ? AND impressions > 0',
-            [$accId, $weekStart, $weekEnd]
-        );
-
-        $spend = (float) ($funnel['spend'] ?? 0);
-        $imp   = (int) ($funnel['imp'] ?? 0);
-
-        if ($imp == 0) {
-            return sprintf(
-                "📅 *Resumo Semanal — %s*\n\n%s · %s a %s\n\nNenhuma impressão ou gasto registrado nos últimos 7 dias. Verifique se as campanhas estão ativas.",
-                $clientName, $accName, date('d/m', strtotime($weekStart)), date('d/m', strtotime($weekEnd))
-            );
-        }
-
-        $revenue = (float) ($funnel['revenue'] ?? 0);
-        $roas    = $spend > 0 ? $revenue / $spend : 0;
-        $convs   = (int)   ($funnel['conv'] ?? 0);
-        $cpa     = $convs > 0 ? $spend / $convs : 0;
-        $clk     = (int)   ($funnel['clk'] ?? 0);
-        $cpc     = $clk > 0 ? $spend / $clk : 0;
-        $ctr     = $imp > 0 ? ($clk / $imp) * 100 : 0;
-
-        $campaigns = Db::all(
-            'SELECT campaign_name,
-                    SUM(impressions) AS imp, SUM(clicks) AS clk, SUM(spend) AS spend,
-                    SUM(landing_page_views) AS lpv, SUM(adds_to_cart) AS atc,
-                    SUM(initiates_checkout) AS ic, SUM(conversions) AS conv,
-                    SUM(conversion_value) AS revenue
-             FROM campaign_insights
-             WHERE meta_account_id = ? AND date_start >= ? AND date_stop <= ? AND impressions > 0
-             GROUP BY campaign_name
-             ORDER BY spend DESC',
-            [$accId, $weekStart, $weekEnd]
-        );
-
-        $lines = [];
-        $lines[] = "📅 *Resumo Semanal — {$clientName}*";
-        $lines[] = "_{$accName}_";
-        $lines[] = '_' . date('d/m', strtotime($weekStart)) . ' a ' . date('d/m', strtotime($weekEnd)) . '_';
-        $lines[] = '';
-        $lines[] = '💰 *Resultado da Semana*';
-        $lines[] = '• Gasto: *' . $this->fmtMoney($spend, $currency) . '*';
-        $lines[] = '• Receita (Valor de Conversão): *' . $this->fmtMoney($revenue, $currency) . '*';
-        if ($roas > 0) $lines[] = '• ROAS: *' . number_format($roas, 2) . 'x*';
-        $lines[] = '• Compras Realizadas: *' . $convs . '*';
-        if ($cpa > 0) $lines[] = '• CPA: *' . $this->fmtMoney($cpa, $currency) . '*';
-        $lines[] = '• Cliques: *' . $clk . '*';
-        $lines[] = '• CPC: *' . $this->fmtMoney($cpc, $currency) . '*';
-        $lines[] = '• CTR: *' . number_format($ctr, 2) . '%*';
-        $lines[] = '• Visualizações de Página: *' . ($funnel['lpv'] ?? 0) . '*';
-        $lines[] = '• Adições ao Carrinho: *' . ($funnel['atc'] ?? 0) . '*';
-        $lines[] = '• Checkouts Iniciados: *' . ($funnel['ic'] ?? 0) . '*';
-
-        if (!empty($campaigns)) {
-            $lines[] = '';
-            $lines[] = '📈 *Performance por Campanha*';
-            foreach ($campaigns as $c) {
-                $cSpend = (float)($c['spend'] ?? 0);
-                $cRev   = (float)($c['revenue'] ?? 0);
-                $cRoas  = $cSpend > 0 ? $cRev / $cSpend : 0;
-                $cConvs = (int)($c['conv'] ?? 0);
-                $cCpa   = $cConvs > 0 ? $cSpend / $cConvs : 0;
-                $cImp   = (int)($c['imp'] ?? 0);
-                $cClk   = (int)($c['clk'] ?? 0);
-                $cCtr   = $cImp > 0 ? ($cClk / $cImp) * 100 : 0;
-                $cCpc   = $cClk > 0 ? $cSpend / $cClk : 0;
-
-                $lines[] = "• *" . self::truncate($c['campaign_name'] ?? 'Campanha Desconhecida', 50) . "*";
-                $lines[] = '   Gasto: ' . $this->fmtMoney($cSpend, $currency) . ' · Receita: ' . $this->fmtMoney($cRev, $currency) . ' · ROAS: ' . number_format($cRoas, 2) . 'x';
-                $lines[] = '   Cliques: ' . $cClk . ' · CPC: ' . $this->fmtMoney($cCpc, $currency) . ' · CTR: ' . number_format($cCtr, 2) . '%';
-                $lines[] = '   Vis. Página: ' . ($c['lpv'] ?? 0) . ' · Carrinho: ' . ($c['atc'] ?? 0) . ' · Checkout: ' . ($c['ic'] ?? 0) . ' · Compras: ' . $cConvs;
-                $lines[] = ''; // Add a blank line between campaigns for readability
-            }
-        }
-
-        $lines[] = '_Saldo WEB · ' . date('H:i', time()) . '_';
-
-        return implode("\n", $lines);
-    }
-
-    // ──────────────────────────── RELATÓRIO SEMANAL AVANÇADO ────────────────────────────
-
-    public function buildAdvancedWeeklyReport(array $account, ?string $weekStart = null): string
-    {
-        $weekStart = $weekStart ?? date('Y-m-d', strtotime('-7 days'));
-        $weekEnd   = date('Y-m-d', strtotime('-1 day'));
-
-        $accId      = (int) $account['id'];
-        $clientName = $account['client_name'] ?? $account['name'];
-        $accName    = $account['account_name'] ?: ('Conta ' . $account['ad_account_id']);
-        $currency   = $account['currency'] ?: 'BRL';
-
-        // Overall week summary
-        $curr = $this->insights->getAccountSummary($accId, $weekStart, $weekEnd);
-
-        // Funnel totals from campaign_insights
-        $funnel = Db::one(
-            'SELECT
-                SUM(impressions) AS imp, SUM(clicks) AS clk, SUM(spend) AS spend,
-                SUM(landing_page_views) AS lpv,
-                SUM(adds_to_cart) AS atc,
-                SUM(initiates_checkout) AS ic,
-                SUM(conversions) AS conv
-             FROM campaign_insights
-             WHERE meta_account_id = ? AND date_start >= ? AND date_stop <= ?',
-            [$accId, $weekStart, $weekEnd]
-        );
-
-        $cpm = ($funnel['imp'] ?? 0) > 0 ? (($funnel['spend'] ?? 0) / $funnel['imp']) * 1000 : 0;
-        $cpc = ($funnel['clk'] ?? 0) > 0 ? ($funnel['spend'] ?? 0) / $funnel['clk'] : 0;
-        $ctr = ($funnel['imp'] ?? 0) > 0 ? (($funnel['clk'] ?? 0) / $funnel['imp']) * 100 : 0;
-
-        $campaigns = Db::all(
-            'SELECT campaign_name,
-                    SUM(impressions) AS imp, SUM(clicks) AS clk, SUM(spend) AS spend,
-                    SUM(landing_page_views) AS lpv, SUM(adds_to_cart) AS atc,
-                    SUM(initiates_checkout) AS ic, SUM(conversions) AS conv,
-                    SUM(conversion_value) AS revenue
-             FROM campaign_insights
-             WHERE meta_account_id = ? AND date_start >= ? AND date_stop <= ? AND impressions > 0
-             GROUP BY campaign_name
-             ORDER BY spend DESC',
-            [$accId, $weekStart, $weekEnd]
-        );
 
         $lines = [];
         $lines[] = "📊 *Relatório Semanal Avançado — {$clientName}*";
         $lines[] = "_{$accName}_";
-        $lines[] = '_' . date('d/m', strtotime($weekStart)) . ' a ' . date('d/m', strtotime($weekEnd)) . '_';
+        $lines[] = "_{$period}_";
         $lines[] = '';
         $lines[] = '💰 *Resultado Geral da Semana*';
-        $lines[] = '• Gasto: *' . $this->fmtMoney((float)($curr['total_spend']??0), $currency) . '*';
-        $lines[] = '• Receita: *' . $this->fmtMoney((float)($curr['total_revenue']??0), $currency) . '*';
-        if (($curr['avg_roas'] ?? 0) > 0) {
-            $lines[] = '• ROAS: *' . number_format((float)$curr['avg_roas'], 2) . 'x*';
-        }
-        $lines[] = '• Conversões: *' . ($curr['total_conversions'] ?? 0) . '*';
-        if (($curr['avg_cpa'] ?? 0) > 0) {
-            $lines[] = '• CPA Médio: *' . $this->fmtMoney((float)$curr['avg_cpa'], $currency) . '*';
-        }
+        $lines[] = '• Gasto: *' . $this->fmtMoney($s['spend'], $currency) . '*';
+        $lines[] = '• Receita: *' . $this->fmtMoney($s['conversion_value'], $currency) . '*';
+        if ($s['roas'] > 0) $lines[] = '• ROAS: *' . number_format($s['roas'], 2) . 'x*';
+        $lines[] = '• Conversões: *' . $s['conversions'] . '*';
+        if ($s['cpa'] > 0) $lines[] = '• CPA Médio: *' . $this->fmtMoney($s['cpa'], $currency) . '*';
 
         $lines[] = '';
         $lines[] = '🌪️ *Métricas de Funil*';
         $lines[] = '🔹 *Topo (Atração)*';
-        $lines[] = '• CPM: *' . $this->fmtMoney($cpm, $currency) . '*';
-        $lines[] = '• CPC: *' . $this->fmtMoney($cpc, $currency) . '*';
-        $lines[] = '• CTR: *' . number_format($ctr, 2) . '%*';
-        $lines[] = '• Visualizações de Página: *' . ($funnel['lpv'] ?? 0) . '*';
+        $lines[] = '• CPM: *' . $this->fmtMoney($s['cpm'], $currency) . '*';
+        $lines[] = '• CPC: *' . $this->fmtMoney($s['cpc'], $currency) . '*';
+        $lines[] = '• CTR: *' . number_format($s['ctr'], 2) . '%*';
+        $lines[] = '• Visualizações de Página: *' . $s['landing_page_views'] . '*';
         $lines[] = '';
         $lines[] = '🔸 *Meio (Consideração)*';
-        $lines[] = '• Adições ao Carrinho: *' . ($funnel['atc'] ?? 0) . '*';
-        $lines[] = '• Checkouts Iniciados: *' . ($funnel['ic'] ?? 0) . '*';
+        $lines[] = '• Adições ao Carrinho: *' . $s['adds_to_cart'] . '*';
+        $lines[] = '• Checkouts Iniciados: *' . $s['initiates_checkout'] . '*';
         $lines[] = '';
         $lines[] = '🎯 *Fundo (Conversão)*';
-        $lines[] = '• Compras (Conversões): *' . ($funnel['conv'] ?? 0) . '*';
+        $lines[] = '• Compras (Conversões): *' . $s['conversions'] . '*';
 
-        if (!empty($campaigns)) {
+        if (!empty($report['campaigns'])) {
             $lines[] = '';
             $lines[] = '📈 *Performance por Campanha*';
-            foreach ($campaigns as $c) {
-                $cSpend = (float)($c['spend'] ?? 0);
-                $cRev   = (float)($c['revenue'] ?? 0);
-                $cRoas  = $cSpend > 0 ? $cRev / $cSpend : 0;
-                $cConvs = (int)($c['conv'] ?? 0);
-                $cCpa   = $cConvs > 0 ? $cSpend / $cConvs : 0;
-                $cImp   = (int)($c['imp'] ?? 0);
-                $cClk   = (int)($c['clk'] ?? 0);
-                $cCtr   = $cImp > 0 ? ($cClk / $cImp) * 100 : 0;
-                $cCpc   = $cClk > 0 ? $cSpend / $cClk : 0;
-
-                $lines[] = "• *" . self::truncate($c['campaign_name'] ?? 'Campanha Desconhecida', 50) . "*";
-                $lines[] = '   Gasto: ' . $this->fmtMoney($cSpend, $currency) . ' · Receita: ' . $this->fmtMoney($cRev, $currency) . ' · ROAS: ' . number_format($cRoas, 2) . 'x';
-                $lines[] = '   Cliques: ' . $cClk . ' · CPC: ' . $this->fmtMoney($cCpc, $currency) . ' · CTR: ' . number_format($cCtr, 2) . '%';
-                $lines[] = '   Vis. Página: ' . ($c['lpv'] ?? 0) . ' · Carrinho: ' . ($c['atc'] ?? 0) . ' · Checkout: ' . ($c['ic'] ?? 0) . ' · Compras: ' . $cConvs;
-                $lines[] = ''; // Add a blank line
+            foreach ($report['campaigns'] as $c) {
+                if ($c['impressions'] == 0) continue;
+                $lines[] = $this->renderCampaignBlock($c, $currency);
             }
         }
 
@@ -332,155 +149,80 @@ final class ReportBuilder
         return implode("\n", $lines);
     }
 
-    // ──────────────────────────── RELATÓRIO PERSONALIZADO (período livre) ────────────────────────────
+    // ═════════════════════════ RELATÓRIO MENSAL ═════════════════════════
 
     /**
-     * Gera relatório para qualquer período: de $dateFrom até $dateTo.
-     * Mesmo formato do diário, mas com o intervalo configurado.
+     * Resumo do mês anterior. Útil para fechamento mensal.
+     */
+    public function buildMonthlySummary(array $account, ?string $monthStart = null): string
+    {
+        if ($monthStart) {
+            $start = $monthStart;
+            $end   = date('Y-m-t', strtotime($monthStart));
+        } else {
+            $start = date('Y-m-01', strtotime('first day of last month'));
+            $end   = date('Y-m-t', strtotime('last day of last month'));
+        }
+
+        $report = $this->safeFetch($account, $start, $end);
+
+        return $this->renderReport($account, $report, [
+            'icon'          => '🗓',
+            'title'         => 'Resumo Mensal',
+            'period_label'  => date('m/Y', strtotime($start)) . ' (' . date('d/m', strtotime($start)) . ' a ' . date('d/m', strtotime($end)) . ')',
+            'section_label' => 'Resultado do Mês',
+            'empty_text'    => 'Nenhuma impressão registrada no período.',
+        ]);
+    }
+
+    // ═════════════════════════ RELATÓRIO PERSONALIZADO ═════════════════════════
+
+    /**
+     * Relatório para qualquer período de/até.
      */
     public function buildCustomReport(array $account, string $dateFrom, string $dateTo): string
     {
-        $accId      = (int) $account['id'];
-        $clientName = $account['client_name'] ?? $account['name'] ?? 'Cliente';
-        $accName    = $account['account_name'] ?: ('Conta ' . $account['ad_account_id']);
-        $currency   = $account['currency'] ?: 'BRL';
+        $report = $this->safeFetch($account, $dateFrom, $dateTo);
 
         $labelFrom = date('d/m/Y', strtotime($dateFrom));
         $labelTo   = date('d/m/Y', strtotime($dateTo));
-        $periodLabel = $dateFrom === $dateTo ? $labelFrom : "{$labelFrom} a {$labelTo}";
+        $period    = $dateFrom === $dateTo ? $labelFrom : "{$labelFrom} a {$labelTo}";
 
-        $funnel = Db::one(
-            'SELECT
-                SUM(impressions) AS imp, SUM(clicks) AS clk, SUM(spend) AS spend,
-                SUM(landing_page_views) AS lpv,
-                SUM(adds_to_cart) AS atc,
-                SUM(initiates_checkout) AS ic,
-                SUM(conversions) AS conv,
-                SUM(conversion_value) AS revenue
-             FROM campaign_insights
-             WHERE meta_account_id = ? AND date_start >= ? AND date_stop <= ? AND impressions > 0',
-            [$accId, $dateFrom, $dateTo]
-        );
-
-        $spend = (float) ($funnel['spend'] ?? 0);
-        $imp   = (int)   ($funnel['imp']   ?? 0);
-
-        if ($imp == 0) {
-            return "🗓️ *Relatório Personalizado — {$clientName}*\n\n_{$accName} · {$periodLabel}_\n\nNenhuma impressão registrada neste período.";
-        }
-
-        $revenue = (float) ($funnel['revenue'] ?? 0);
-        $roas    = $spend > 0 ? $revenue / $spend : 0;
-        $convs   = (int)   ($funnel['conv']    ?? 0);
-        $cpa     = $convs > 0 ? $spend / $convs : 0;
-        $clk     = (int)   ($funnel['clk']     ?? 0);
-        $cpc     = $clk   > 0 ? $spend / $clk  : 0;
-        $ctr     = $imp   > 0 ? ($clk / $imp) * 100 : 0;
-
-        $campaigns = Db::all(
-            'SELECT campaign_name,
-                    SUM(impressions) AS imp, SUM(clicks) AS clk, SUM(spend) AS spend,
-                    SUM(landing_page_views) AS lpv, SUM(adds_to_cart) AS atc,
-                    SUM(initiates_checkout) AS ic, SUM(conversions) AS conv,
-                    SUM(conversion_value) AS revenue
-             FROM campaign_insights
-             WHERE meta_account_id = ? AND date_start >= ? AND date_stop <= ? AND impressions > 0
-             GROUP BY campaign_name
-             ORDER BY spend DESC',
-            [$accId, $dateFrom, $dateTo]
-        );
-
-        $lines = [];
-        $lines[] = "🗓️ *Relatório Personalizado — {$clientName}*";
-        $lines[] = "_{$accName}_";
-        $lines[] = "_{$periodLabel}_";
-        $lines[] = '';
-        $lines[] = '💰 *Resultado do Período*';
-        $lines[] = '• Gasto: *' . $this->fmtMoney($spend, $currency) . '*';
-        $lines[] = '• Receita (Valor de Conversão): *' . $this->fmtMoney($revenue, $currency) . '*';
-        if ($roas > 0) $lines[] = '• ROAS: *' . number_format($roas, 2) . 'x*';
-        $lines[] = '• Compras Realizadas: *' . $convs . '*';
-        if ($cpa > 0) $lines[] = '• CPA: *' . $this->fmtMoney($cpa, $currency) . '*';
-        $lines[] = '• Cliques: *' . $clk . '*';
-        $lines[] = '• CPC: *' . $this->fmtMoney($cpc, $currency) . '*';
-        $lines[] = '• CTR: *' . number_format($ctr, 2) . '%*';
-        $lines[] = '• Visualizações de Página: *' . ($funnel['lpv'] ?? 0) . '*';
-        $lines[] = '• Adições ao Carrinho: *' . ($funnel['atc'] ?? 0) . '*';
-        $lines[] = '• Checkouts Iniciados: *' . ($funnel['ic'] ?? 0) . '*';
-
-        if (!empty($campaigns)) {
-            $lines[] = '';
-            $lines[] = '📈 *Performance por Campanha*';
-            foreach ($campaigns as $c) {
-                $cSpend = (float)($c['spend'] ?? 0);
-                $cRev   = (float)($c['revenue'] ?? 0);
-                $cRoas  = $cSpend > 0 ? $cRev / $cSpend : 0;
-                $cConvs = (int)($c['conv'] ?? 0);
-                $cCpa   = $cConvs > 0 ? $cSpend / $cConvs : 0;
-                $cImp   = (int)($c['imp'] ?? 0);
-                $cClk   = (int)($c['clk'] ?? 0);
-                $cCtr   = $cImp > 0 ? ($cClk / $cImp) * 100 : 0;
-                $cCpc   = $cClk > 0 ? $cSpend / $cClk : 0;
-
-                $lines[] = '• *' . self::truncate($c['campaign_name'] ?? 'Campanha Desconhecida', 50) . '*';
-                $lines[] = '   Gasto: ' . $this->fmtMoney($cSpend, $currency) . ' · Receita: ' . $this->fmtMoney($cRev, $currency) . ' · ROAS: ' . number_format($cRoas, 2) . 'x';
-                $lines[] = '   Cliques: ' . $cClk . ' · CPC: ' . $this->fmtMoney($cCpc, $currency) . ' · CTR: ' . number_format($cCtr, 2) . '%';
-                $lines[] = '   Vis. Página: ' . ($c['lpv'] ?? 0) . ' · Carrinho: ' . ($c['atc'] ?? 0) . ' · Checkout: ' . ($c['ic'] ?? 0) . ' · Compras: ' . $cConvs;
-                $lines[] = '';
-            }
-        }
-
-        $lines[] = '_Saldo WEB · ' . date('H:i', time()) . '_';
-        return implode("\n", $lines);
+        return $this->renderReport($account, $report, [
+            'icon'          => '🗓️',
+            'title'         => 'Relatório Personalizado',
+            'period_label'  => $period,
+            'section_label' => 'Resultado do Período',
+            'empty_text'    => 'Nenhuma impressão registrada neste período.',
+        ]);
     }
 
-    // ──────────────────────────── PRÉVIA DE FIM DE SEMANA ────────────────────────────
+    // ═════════════════════════ PRÉVIA DE FIM DE SEMANA ═════════════════════════
 
     /**
-     * Gera prévia de fim de semana — enviada toda sexta-feira.
-     * Mostra projeção de gasto sábado+domingo, ROAS da semana e criativos top ativos.
+     * Prévia de fim de semana — sexta antes de sair do ar.
      */
     public function buildWeekendForecast(array $account, ?string $referenceDate = null): string
     {
         $today      = $referenceDate ?? date('Y-m-d');
         $weekStart  = date('Y-m-d', strtotime('monday this week', strtotime($today)));
-        $accId      = (int) $account['id'];
         $clientName = $account['client_name'] ?? $account['name'] ?? 'Cliente';
         $accName    = $account['account_name'] ?: ('Conta ' . $account['ad_account_id']);
         $currency   = $account['currency'] ?: 'BRL';
 
-        // Métricas da semana até hoje (seg–sex)
-        $weekSummary = $this->insights->getAccountSummary($accId, $weekStart, $today);
+        $weekReport = $this->safeFetch($account, $weekStart, $today);
+        $last7Start = date('Y-m-d', strtotime('-7 days', strtotime($today)));
+        $last7      = $this->safeFetch($account, $last7Start, $today);
 
-        // Média diária dos últimos 7 dias para projetar o final de semana
-        $last7 = $this->insights->getAccountSummary(
-            $accId,
-            date('Y-m-d', strtotime('-7 days', strtotime($today))),
-            $today
-        );
-        $days7     = 7;
-        $avgDaily  = (float) ($last7['total_spend'] ?? 0) / $days7;
-        $projected = $avgDaily * 2; // sábado + domingo
+        $s         = $weekReport['summary'];
+        $avgDaily  = (float) ($last7['summary']['spend'] ?? 0) / 7;
+        $projected = $avgDaily * 2;
 
-        // Top 3 criativos ativos desta semana
-        $topAds = Db::all(
-            'SELECT ad_id, ad_name, campaign_name,
-                    SUM(spend) AS spend, SUM(conversions) AS conversions,
-                    SUM(conversion_value)/NULLIF(SUM(spend),0) AS roas,
-                    MAX(effective_status) AS effective_status
-             FROM ad_insights
-             WHERE meta_account_id = ? AND date_start >= ? AND date_stop <= ?
-               AND effective_status = \'ACTIVE\'
-             GROUP BY ad_id, ad_name, campaign_name
-             HAVING spend > 0
-             ORDER BY roas DESC LIMIT 3',
-            [$accId, $weekStart, $today]
-        );
-
-        $spend   = (float) ($weekSummary['total_spend'] ?? 0);
-        $roas    = (float) ($weekSummary['avg_roas'] ?? 0);
-        $convs   = (int)   ($weekSummary['total_conversions'] ?? 0);
-        $revenue = (float) ($weekSummary['total_revenue'] ?? 0);
+        // Top 3 ads ativos
+        $topAds = [];
+        try {
+            $topAds = $this->insights->fetchTopAds($account['ad_account_id'], $weekStart, $today, 3);
+        } catch (Throwable $e) { /* ignora */ }
 
         $lines = [];
         $lines[] = "🔮 *Prévia do Fim de Semana — {$clientName}*";
@@ -488,10 +230,10 @@ final class ReportBuilder
         $lines[] = '_' . date('d/m', strtotime($weekStart)) . ' a hoje_';
         $lines[] = '';
         $lines[] = '📈 *Semana até agora*';
-        $lines[] = '• Gasto: *' . $this->fmtMoney($spend, $currency) . '*';
-        if ($revenue > 0) $lines[] = '• Receita: *' . $this->fmtMoney($revenue, $currency) . '*';
-        if ($roas > 0)    $lines[] = '• ROAS: *' . number_format($roas, 2) . 'x*';
-        if ($convs > 0)   $lines[] = '• Conversões: *' . $convs . '*';
+        $lines[] = '• Gasto: *' . $this->fmtMoney($s['spend'], $currency) . '*';
+        if ($s['conversion_value'] > 0) $lines[] = '• Receita: *' . $this->fmtMoney($s['conversion_value'], $currency) . '*';
+        if ($s['roas'] > 0)             $lines[] = '• ROAS: *' . number_format($s['roas'], 2) . 'x*';
+        if ($s['conversions'] > 0)      $lines[] = '• Conversões: *' . $s['conversions'] . '*';
 
         $lines[] = '';
         $lines[] = '🗓 *Projeção do final de semana (sáb + dom)*';
@@ -500,13 +242,14 @@ final class ReportBuilder
 
         if (!empty($topAds)) {
             $lines[] = '';
-            $lines[] = '🏆 *Criativos ativos para monitorar*';
+            $lines[] = '🏆 *Criativos para monitorar*';
             foreach ($topAds as $i => $ad) {
+                if (($ad['effective_status'] ?? '') !== 'ACTIVE') continue;
                 $medal = ['🥇', '🥈', '🥉'][$i] ?? '▫️';
                 $name  = self::truncate($ad['ad_name'] ?? 'Anúncio', 55);
                 $lines[] = "{$medal} {$name}";
-                if ((float)$ad['roas'] > 0) {
-                    $lines[] = '   ROAS: *' . number_format((float)$ad['roas'], 2) . 'x* · Gasto: ' . $this->fmtMoney((float)$ad['spend'], $currency);
+                if ($ad['roas'] > 0) {
+                    $lines[] = '   ROAS: *' . number_format($ad['roas'], 2) . 'x* · Gasto: ' . $this->fmtMoney($ad['spend'], $currency);
                 }
             }
         }
@@ -518,30 +261,130 @@ final class ReportBuilder
         return implode("\n", $lines);
     }
 
-    // ──────────────────────────── HELPERS ────────────────────────────
+    // ═════════════════════════ INTERNALS ═════════════════════════
+
+    /**
+     * Faz fetch da API com fallback estruturado em caso de erro.
+     */
+    private function safeFetch(array $account, string $since, string $until): array
+    {
+        try {
+            return $this->insights->fetchAccountReport($account['ad_account_id'], $since, $until);
+        } catch (Throwable $e) {
+            return [
+                'summary'   => $this->emptySummary(),
+                'campaigns' => [],
+                'period'    => ['since' => $since, 'until' => $until],
+                'error'     => $e->getMessage(),
+            ];
+        }
+    }
+
+    private function emptySummary(): array
+    {
+        return [
+            'spend'              => 0.0,
+            'impressions'        => 0,
+            'clicks'             => 0,
+            'reach'              => 0,
+            'conversions'        => 0,
+            'conversion_value'   => 0.0,
+            'leads'              => 0,
+            'landing_page_views' => 0,
+            'adds_to_cart'       => 0,
+            'initiates_checkout' => 0,
+            'ctr' => 0, 'cpc' => 0, 'cpm' => 0, 'cpa' => 0, 'roas' => 0,
+        ];
+    }
+
+    /**
+     * Renderiza o relatório padrão (Diário / Semanal / Mensal / Personalizado).
+     * O formato é único — só muda o título, ícone e label do período.
+     *
+     * @param array $opts {
+     *   icon: string,             // emoji do título
+     *   title: string,            // ex: "Resumo Diário"
+     *   period_label: string,     // ex: "29/04/2026"
+     *   section_label: string,    // ex: "Resultado do Dia"
+     *   empty_text: string        // mensagem quando não há impressões
+     * }
+     */
+    private function renderReport(array $account, array $report, array $opts): string
+    {
+        $clientName = $account['client_name'] ?? $account['name'] ?? 'Cliente';
+        $accName    = $account['account_name'] ?: ('Conta ' . $account['ad_account_id']);
+        $currency   = $account['currency'] ?: 'BRL';
+
+        $s = $report['summary'];
+
+        // Vazio
+        if (($s['impressions'] ?? 0) == 0) {
+            $errorTxt = !empty($report['error']) ? "\n\n⚠️ Erro ao buscar dados: " . $report['error'] : '';
+            return "{$opts['icon']} *{$opts['title']} — {$clientName}*\n_{$accName} · {$opts['period_label']}_\n\n{$opts['empty_text']}{$errorTxt}";
+        }
+
+        $lines = [];
+        $lines[] = "{$opts['icon']} *{$opts['title']} — {$clientName}*";
+        $lines[] = "_{$accName} · {$opts['period_label']}_";
+        $lines[] = '';
+        $lines[] = "💰 *{$opts['section_label']}*";
+        $lines[] = '• Gasto: *' . $this->fmtMoney($s['spend'], $currency) . '*';
+        $lines[] = '• Receita (Valor de Conversão): *' . $this->fmtMoney($s['conversion_value'], $currency) . '*';
+        if ($s['roas'] > 0) $lines[] = '• ROAS: *' . number_format($s['roas'], 2) . 'x*';
+        $lines[] = '• Compras Realizadas: *' . $s['conversions'] . '*';
+        if ($s['cpa'] > 0) $lines[] = '• CPA: *' . $this->fmtMoney($s['cpa'], $currency) . '*';
+        $lines[] = '• Cliques: *' . $s['clicks'] . '*';
+        $lines[] = '• CPC: *' . $this->fmtMoney($s['cpc'], $currency) . '*';
+        $lines[] = '• CTR: *' . number_format($s['ctr'], 2) . '%*';
+        $lines[] = '• Visualizações de Página: *' . $s['landing_page_views'] . '*';
+        $lines[] = '• Adições ao Carrinho: *' . $s['adds_to_cart'] . '*';
+        $lines[] = '• Checkouts Iniciados: *' . $s['initiates_checkout'] . '*';
+
+        // Apenas campanhas com impressões > 0 entram no breakdown
+        $activeCampaigns = array_filter($report['campaigns'], fn($c) => $c['impressions'] > 0);
+        if (!empty($activeCampaigns)) {
+            $lines[] = '';
+            $lines[] = '📈 *Performance por Campanha*';
+            foreach ($activeCampaigns as $c) {
+                $lines[] = $this->renderCampaignBlock($c, $currency);
+            }
+        }
+
+        $lines[] = '_Saldo WEB · ' . date('H:i') . '_';
+
+        return implode("\n", $lines);
+    }
+
+    /**
+     * Renderiza o bloco de uma campanha no breakdown.
+     */
+    private function renderCampaignBlock(array $c, string $currency): string
+    {
+        $name = self::truncate($c['campaign_name'] ?? 'Campanha Desconhecida', 50);
+        $b = [];
+        $b[] = "• *{$name}*";
+        $b[] = '   Gasto: ' . $this->fmtMoney($c['spend'], $currency)
+             . ' · Receita: ' . $this->fmtMoney($c['conversion_value'], $currency)
+             . ' · ROAS: ' . number_format($c['roas'], 2) . 'x';
+        $b[] = '   Cliques: ' . $c['clicks']
+             . ' · CPC: ' . $this->fmtMoney($c['cpc'], $currency)
+             . ' · CTR: ' . number_format($c['ctr'], 2) . '%';
+        $b[] = '   Vis. Página: ' . $c['landing_page_views']
+             . ' · Carrinho: ' . $c['adds_to_cart']
+             . ' · Checkout: ' . $c['initiates_checkout']
+             . ' · Compras: ' . $c['conversions'];
+        $b[] = '';
+        return implode("\n", $b);
+    }
+
+    // ════════════════════════════ HELPERS ════════════════════════════
 
     private function fmtMoney(float $value, string $currency): string
     {
-        // Valores vêm já em unidades reais da moeda (euros, reais, etc.) — não em centavos
         if ($currency === 'BRL') {
             return 'R$ ' . number_format($value, 2, ',', '.');
         }
         return number_format($value, 2) . ' ' . $currency;
-    }
-
-    /**
-     * Gera sufixo com variação percentual colorido para WhatsApp.
-     * $inverse = true: subida é ruim (ex: CPA)
-     */
-    private static function delta(?float $pct, bool $higherIsBetter = true, bool $inverse = false): string
-    {
-        if ($pct === null || $pct === 0.0) return '';
-        $going_up = $pct > 0;
-        $good     = $higherIsBetter ? $going_up : !$going_up;
-        if ($inverse) $good = !$good;
-        $arrow = $going_up ? '▲' : '▼';
-        $emoji = $good ? '✅' : '🔴';
-        return " {$emoji} {$arrow}" . number_format(abs($pct), 1) . '%';
     }
 
     private static function truncate(string $s, int $max): string
