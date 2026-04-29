@@ -37,6 +37,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         Db::setSetting('report_approval', isset($_POST['report_approval']) ? '1' : '0');
         Db::setSetting('site_url', trim($_POST['site_url'] ?? ''));
         Db::setSetting('alert_cooldown_hours', (string) max(1, (int) ($_POST['alert_cooldown_hours'] ?? 6)));
+
+        // Performance & Insights — paridade com gerenciador
+        $convEvt = trim($_POST['conversion_event'] ?? 'purchase');
+        if ($convEvt !== '') Db::setSetting('conversion_event', $convEvt);
+
+        $attrIn = trim($_POST['attribution_windows'] ?? 'default');
+        // Normaliza: aceita 'default' ou lista de janelas separadas por vírgula
+        $attrAllowed = ['default','1d_view','7d_view','28d_view','1d_click','7d_click','28d_click'];
+        $attrParts   = array_filter(array_map('trim', explode(',', $attrIn)));
+        $attrParts   = array_values(array_intersect($attrParts, $attrAllowed));
+        Db::setSetting('attribution_windows', $attrParts ? implode(',', $attrParts) : 'default');
+
         flash('Configurações salvas com sucesso.', 'success');
         header('Location: settings.php');
         exit;
@@ -186,6 +198,49 @@ ob_start();
           <input id="evo_instance" name="evolution_instance" class="form-control"
                  placeholder="saldoweb"
                  value="<?= e(Db::getSetting('evolution_instance') ?: '') ?>">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Performance & Insights -->
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <span class="card-header-title"><i class="bi bi-graph-up"></i> Performance & Insights</span>
+      <span style="font-size:12px;color:var(--text-4)">Paridade com Gerenciador de Anúncios</span>
+    </div>
+    <div class="card-body">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div class="form-group" style="margin:0">
+          <label class="form-label" for="conv_evt">Evento de conversão</label>
+          <select id="conv_evt" name="conversion_event" class="form-select">
+            <?php $ce = Db::getSetting('conversion_event') ?: 'purchase'; ?>
+            <option value="purchase"          <?= $ce==='purchase'?'selected':'' ?>>purchase (e-commerce / vendas)</option>
+            <option value="lead"              <?= $ce==='lead'?'selected':'' ?>>lead (geração de leads)</option>
+            <option value="complete_registration" <?= $ce==='complete_registration'?'selected':'' ?>>complete_registration</option>
+            <option value="subscribe"         <?= $ce==='subscribe'?'selected':'' ?>>subscribe</option>
+            <option value="add_to_cart"       <?= $ce==='add_to_cart'?'selected':'' ?>>add_to_cart</option>
+            <option value="initiate_checkout" <?= $ce==='initiate_checkout'?'selected':'' ?>>initiate_checkout</option>
+          </select>
+          <div class="form-hint">Define qual evento conta como "conversão". Use o mesmo que está no objetivo das suas campanhas.</div>
+        </div>
+        <div class="form-group" style="margin:0">
+          <label class="form-label" for="attr_win">Janela de atribuição</label>
+          <select id="attr_win" name="attribution_windows" class="form-select">
+            <?php $aw = Db::getSetting('attribution_windows') ?: 'default'; ?>
+            <option value="default"            <?= $aw==='default'?'selected':'' ?>>default — usa a config da conta (recomendado)</option>
+            <option value="7d_click,1d_view"   <?= $aw==='7d_click,1d_view'?'selected':'' ?>>7d_click, 1d_view (padrão Meta clássico)</option>
+            <option value="7d_click"           <?= $aw==='7d_click'?'selected':'' ?>>7d_click apenas</option>
+            <option value="1d_click"           <?= $aw==='1d_click'?'selected':'' ?>>1d_click apenas</option>
+            <option value="28d_click,1d_view"  <?= $aw==='28d_click,1d_view'?'selected':'' ?>>28d_click, 1d_view</option>
+          </select>
+          <div class="form-hint">Janela de atribuição. <strong>"default"</strong> usa o que cada campanha configurou no gerenciador — é o que faz os números baterem 100%.</div>
+        </div>
+      </div>
+      <div class="alert alert-info" style="margin-top:14px;font-size:12.5px">
+        <i class="bi bi-info-circle-fill" style="font-size:14px;flex-shrink:0"></i>
+        <div>
+          O sistema usa <code>use_unified_attribution_setting=true</code> nas chamadas à Meta API e aplica a regra de prioridade <code>omni_purchase</code> &gt; <code>purchase</code> &gt; <code>fb_pixel_purchase</code> para evitar duplicação de conversões. <strong>Re-coletar dados antigos pode ser necessário</strong> após mudar essas opções (botão "Coletar" em Performance).
         </div>
       </div>
     </div>

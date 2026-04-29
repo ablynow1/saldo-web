@@ -4,10 +4,30 @@ declare(strict_types=1);
 /**
  * Cliente de métricas de performance da Meta Marketing API.
  *
- * Coleta dados de campanhas e anúncios (ROAS, CPA, CTR, etc.)
- * e salva nas tabelas ad_insights e campaign_insights.
+ * IMPORTANTE — Paridade com o Gerenciador de Anúncios da Meta
+ * ──────────────────────────────────────────────────────────────────
+ * Para que SPEND, CONVERSÕES, ROAS e CPA batam EXATAMENTE com o que
+ * o cliente vê no Gerenciador (Ads Manager), três configurações são
+ * essenciais e estão aplicadas em todas as chamadas de insights:
  *
- * Conversões: identifica o tipo de conversão pelo setting 'conversion_event'
+ *   1. use_unified_attribution_setting = true
+ *      Faz a API respeitar a janela de atribuição configurada na
+ *      campanha/conta — exatamente o mesmo que o gerenciador usa.
+ *
+ *   2. action_attribution_windows = ['default']
+ *      Garante que o número de conversões e o conversion_value
+ *      reflitam a janela padrão da conta (geralmente 7d_click,1d_view).
+ *
+ *   3. Resolução de tipo de evento por PRIORIDADE (não por SOMA)
+ *      O gerenciador mostra UM número consolidado por evento. A API
+ *      retorna múltiplos action_types para o "mesmo" evento (ex.:
+ *      `omni_purchase`, `purchase`, `offsite_conversion.fb_pixel_purchase`).
+ *      Se somarmos todos, duplicamos. A regra correta é PRIORIDADE:
+ *        omni_<event>  →  <event>  →  offsite_conversion.fb_pixel_<event>
+ *                      →  onsite_conversion.<event>_grouped
+ *      Pega o primeiro disponível e ignora os demais.
+ *
+ * Conversões: o tipo de evento vem do setting 'conversion_event'
  * (padrão: 'purchase'). Contas de leads devem mudar para 'lead'.
  */
 final class InsightsClient
@@ -15,12 +35,19 @@ final class InsightsClient
     private string $token;
     private string $apiVersion;
     private string $conversionEvent;
+    /** @var string[] Janelas de atribuição (ex: ['default'], ['7d_click','1d_view']) */
+    private array $attributionWindows;
 
-    public function __construct(string $token, string $apiVersion = 'v19.0', string $conversionEvent = 'purchase')
-    {
-        $this->token           = $token;
-        $this->apiVersion      = $apiVersion;
-        $this->conversionEvent = $conversionEvent;
+    public function __construct(
+        string $token,
+        string $apiVersion = 'v19.0',
+        string $conversionEvent = 'purchase',
+        array  $attributionWindows = ['default']
+    ) {
+        $this->token              = $token;
+        $this->apiVersion         = $apiVersion;
+        $this->conversionEvent    = $conversionEvent;
+        $this->attributionWindows = $attributionWindows ?: ['default'];
     }
 
     public static function fromSettings(): self
@@ -28,8 +55,11 @@ final class InsightsClient
         $token = Db::getSetting('meta_system_user_token');
         $ver   = Db::getSetting('meta_api_version') ?: 'v19.0';
         $conv  = Db::getSetting('conversion_event') ?: 'purchase';
+        $attr  = Db::getSetting('attribution_windows') ?: 'default';
         if (!$token) throw new RuntimeException('System User Token não configurado.');
-        return new self($token, $ver, $conv);
+
+        $windows = array_values(array_filter(array_map('trim', explode(',', $attr))));
+        return new self($token, $ver, $conv, $windows);
     }
 
     /**
@@ -58,12 +88,8 @@ final class InsightsClient
             'date_start', 'date_stop',
         ]);
 
-        $params = ['fields' => $fields, 'level' => 'ad', 'access_token' => $this->token, 'limit' => 500];
-        if ($datePreset === 'custom' && $since && $until) {
-            $params['time_range'] = json_encode(['since' => $since, 'until' => $until]);
-        } else {
-            $params['date_preset'] = $datePreset;
-        }
+        $params = $this->baseParams($fields, 'ad', 500);
+        $this->applyDateRange($params, $datePreset, $since, $until);
 
         $url = sprintf(
             'https://graph.facebook.com/%s/act_%s/insights?%s',
@@ -114,12 +140,9 @@ final class InsightsClient
         ?string $until = null
     ): array {
         $fields = 'campaign_id,campaign_name,spend,impressions,clicks,actions,action_values,date_start,date_stop';
-        $params = ['fields' => $fields, 'level' => 'campaign', 'access_token' => $this->token, 'limit' => 200];
-        if ($datePreset === 'custom' && $since && $until) {
-            $params['time_range'] = json_encode(['since' => $since, 'until' => $until]);
-        } else {
-            $params['date_preset'] = $datePreset;
-        }
+
+        $params = $this->baseParams($fields, 'campaign', 200);
+        $this->applyDateRange($params, $datePreset, $since, $until);
 
         $url = sprintf(
             'https://graph.facebook.com/%s/act_%s/insights?%s',
@@ -218,46 +241,85 @@ final class InsightsClient
 
     // ───────────────────────────────── helpers privados ─────────────────────────────────
 
+    /**
+     * Parâmetros base aplicados em TODAS as chamadas de insights.
+     * Garantem paridade com o que o cliente vê no Gerenciador.
+     */
+    private function baseParams(string $fields, string $level, int $limit): array
+    {
+        return [
+            'fields'                          => $fields,
+            'level'                           => $level,
+            'access_token'                    => $this->token,
+            'limit'                           => $limit,
+            // ↓↓↓ críticos para paridade com o Gerenciador ↓↓↓
+            'use_unified_attribution_setting' => 'true',
+            'action_attribution_windows'      => json_encode($this->attributionWindows),
+        ];
+    }
+
+    /**
+     * Aplica o intervalo de datas (date_preset OU time_range) ao array de parâmetros.
+     */
+    private function applyDateRange(array &$params, string $datePreset, ?string $since, ?string $until): void
+    {
+        if ($datePreset === 'custom' && $since && $until) {
+            $params['time_range'] = json_encode(['since' => $since, 'until' => $until]);
+        } else {
+            $params['date_preset'] = $datePreset;
+        }
+    }
+
+    /**
+     * Extrai métricas de uma linha de insights respeitando a regra de PRIORIDADE
+     * (sem somar action_types redundantes — o gerenciador também não soma).
+     */
     private function parseRow(array $row): array
     {
-        $spend = (float) ($row['spend'] ?? 0);
+        $spend     = (float) ($row['spend'] ?? 0);
+        $actions   = $row['actions']        ?? [];
+        $values    = $row['action_values']  ?? [];
 
-        // Soma todos os actions do tipo de conversão configurado
-        $actions    = $row['actions'] ?? [];
-        $actValues  = $row['action_values'] ?? [];
+        $event = $this->conversionEvent;
 
-        $conversions      = 0;
-        $conversionValue  = 0.0;
-        $leads            = 0;
-        $landingPageViews = 0;
-        $addsToCart       = 0;
-        $initiatesCheckout = 0;
+        // PRIORIDADE — gerenciador mostra o consolidado (omni_*) quando disponível.
+        // Se a conta é mais antiga (sem omni), cai no nome do evento puro, depois pixel/onsite.
+        $eventPriority = [
+            "omni_{$event}",
+            $event,
+            "offsite_conversion.fb_pixel_{$event}",
+            "onsite_conversion.{$event}_grouped",
+        ];
 
-        foreach ($actions as $a) {
-            $t = $a['action_type'] ?? '';
-            $v = (float) ($a['value'] ?? 0);
-            if ($t === $this->conversionEvent || $t === "offsite_conversion.fb_pixel_{$this->conversionEvent}") {
-                $conversions += (int) round($v);
-            }
-            if ($t === 'lead' || $t === 'onsite_conversion.lead_grouped') {
-                $leads += (int) round($v);
-            }
-            if ($t === 'landing_page_view' || $t === 'onsite_conversion.landing_page_view' || $t === 'offsite_conversion.fb_pixel_custom') { // FB Pixel view content ou LPV
-                $landingPageViews += (int) round($v);
-            }
-            if ($t === 'add_to_cart' || $t === 'offsite_conversion.fb_pixel_add_to_cart') {
-                $addsToCart += (int) round($v);
-            }
-            if ($t === 'initiate_checkout' || $t === 'offsite_conversion.fb_pixel_initiate_checkout') {
-                $initiatesCheckout += (int) round($v);
-            }
-        }
-        foreach ($actValues as $a) {
-            $t = $a['action_type'] ?? '';
-            if ($t === $this->conversionEvent || $t === "offsite_conversion.fb_pixel_{$this->conversionEvent}") {
-                $conversionValue += (float) ($a['value'] ?? 0);
-            }
-        }
+        [$conversions, $conversionValue] = $this->resolveAction($actions, $values, $eventPriority);
+
+        // Leads — mesma lógica
+        $leadPriority = [
+            'omni_lead',
+            'lead',
+            'offsite_conversion.fb_pixel_lead',
+            'onsite_conversion.lead_grouped',
+        ];
+        [$leads, /* $_ */] = $this->resolveAction($actions, [], $leadPriority);
+
+        // Outros eventos auxiliares (também por prioridade, sem soma duplicada)
+        [$landingPageViews, /* $_ */] = $this->resolveAction($actions, [], [
+            'omni_landing_page_view',
+            'landing_page_view',
+            'onsite_conversion.landing_page_view',
+        ]);
+        [$addsToCart, /* $_ */] = $this->resolveAction($actions, [], [
+            'omni_add_to_cart',
+            'add_to_cart',
+            'offsite_conversion.fb_pixel_add_to_cart',
+            'onsite_conversion.add_to_cart_grouped',
+        ]);
+        [$initiatesCheckout, /* $_ */] = $this->resolveAction($actions, [], [
+            'omni_initiated_checkout',
+            'initiate_checkout',
+            'offsite_conversion.fb_pixel_initiate_checkout',
+            'onsite_conversion.initiate_checkout_grouped',
+        ]);
 
         $impressions = (int) ($row['impressions'] ?? 0);
         $clicks      = (int) ($row['clicks'] ?? 0);
@@ -269,7 +331,79 @@ final class InsightsClient
         $cpp  = $impressions > 0 ? ($spend / $impressions) * 1000 : 0;
         $cpm  = $cpp;
 
-        return compact('conversions', 'conversionValue', 'leads', 'landingPageViews', 'addsToCart', 'initiatesCheckout', 'ctr', 'cpc', 'cpa', 'roas', 'cpp', 'cpm');
+        return [
+            'conversions'       => (int) $conversions,
+            'conversionValue'   => (float) $conversionValue,
+            'leads'             => (int) $leads,
+            'landingPageViews'  => (int) $landingPageViews,
+            'addsToCart'        => (int) $addsToCart,
+            'initiatesCheckout' => (int) $initiatesCheckout,
+            'ctr'               => $ctr,
+            'cpc'               => $cpc,
+            'cpa'               => $cpa,
+            'roas'              => $roas,
+            'cpp'               => $cpp,
+            'cpm'               => $cpm,
+        ];
+    }
+
+    /**
+     * Procura nos arrays de actions/values o PRIMEIRO action_type da lista
+     * de prioridade que existir, retornando [count, value]. Não soma —
+     * isso evita duplicação (igual ao comportamento do Gerenciador).
+     *
+     * @param array $actions  Array de objetos {action_type, value, [1d_click, 7d_click, ...]}
+     * @param array $values   Array de objetos {action_type, value, ...} para conversion_value
+     * @param string[] $priority  Lista ordenada de tipos preferidos
+     * @return array{0:float, 1:float}  [count, valueSum]
+     */
+    private function resolveAction(array $actions, array $values, array $priority): array
+    {
+        // Constrói índice por action_type para lookup O(1)
+        $actionByType = [];
+        foreach ($actions as $a) {
+            $t = $a['action_type'] ?? '';
+            if ($t !== '') $actionByType[$t] = $a;
+        }
+        $valueByType = [];
+        foreach ($values as $v) {
+            $t = $v['action_type'] ?? '';
+            if ($t !== '') $valueByType[$t] = $v;
+        }
+
+        foreach ($priority as $type) {
+            if (!isset($actionByType[$type])) continue;
+            $count = $this->extractAttributedValue($actionByType[$type]);
+            $val   = isset($valueByType[$type]) ? $this->extractAttributedValue($valueByType[$type]) : 0.0;
+            return [$count, $val];
+        }
+        return [0.0, 0.0];
+    }
+
+    /**
+     * Extrai o valor atribuído de um objeto de action.
+     *
+     * Quando `use_unified_attribution_setting=true`, a Meta retorna o número
+     * agregado direto em `value`. Quando se passa `action_attribution_windows`
+     * customizado, ela pode retornar campos extras como `7d_click`, `1d_view`,
+     * etc. — nesse caso, somamos essas janelas explicitamente.
+     */
+    private function extractAttributedValue(array $obj): float
+    {
+        // Se tiver janelas explícitas configuradas (não 'default'), soma só elas
+        if (count($this->attributionWindows) > 0 && $this->attributionWindows !== ['default']) {
+            $sum = 0.0;
+            $found = false;
+            foreach ($this->attributionWindows as $w) {
+                if (isset($obj[$w])) {
+                    $sum  += (float) $obj[$w];
+                    $found = true;
+                }
+            }
+            if ($found) return $sum;
+        }
+        // Caso padrão: usa o `value` que já vem agregado pelo unified setting
+        return (float) ($obj['value'] ?? 0);
     }
 
     private function upsertAdInsight(int $accountDbId, array $row, array $m): void
