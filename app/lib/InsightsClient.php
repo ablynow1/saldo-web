@@ -260,13 +260,30 @@ final class InsightsClient
 
     /**
      * Aplica o intervalo de datas (date_preset OU time_range) ao array de parâmetros.
+     *
+     * IMPORTANTE — sempre força time_increment=1 quando o range cobre mais de
+     * um dia. Sem isso a Meta API retorna UMA linha agregada do período todo,
+     * que ao ser persistida com unique key (entity_id, date_start) acabaria
+     * sobrescrevendo o registro diário do primeiro dia do range com o total
+     * agregado, inflando a SUM(spend) em queries posteriores.
+     *
+     * Com time_increment=1, a API retorna uma linha por DIA — exatamente
+     * o que o esquema (ad_insights / campaign_insights) espera.
      */
     private function applyDateRange(array &$params, string $datePreset, ?string $since, ?string $until): void
     {
         if ($datePreset === 'custom' && $since && $until) {
             $params['time_range'] = json_encode(['since' => $since, 'until' => $until]);
+            // Se for um range multi-dia, particiona em linhas diárias
+            if ($since !== $until) {
+                $params['time_increment'] = 1;
+            }
         } else {
             $params['date_preset'] = $datePreset;
+            // last_7d, last_14d, last_30d, last_90d → multi-dia → particiona
+            if (in_array($datePreset, ['last_7d', 'last_14d', 'last_30d', 'last_90d', 'last_quarter', 'last_year', 'this_month', 'last_month', 'this_week_mon_today', 'last_week_mon_sun', 'this_quarter'], true)) {
+                $params['time_increment'] = 1;
+            }
         }
     }
 
